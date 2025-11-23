@@ -89,7 +89,7 @@ def plot_proba(
     grid_resolution=300,
     padding=0.8,
     levels=100,
-    cmap_single="Blues",
+    cmap_single="viridis",
     scatter_kwargs=None,
     ax=None,
     device=None,
