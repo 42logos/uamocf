@@ -1,0 +1,703 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{float}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\definecolor{codegray}{rgb}{0.95,0.95,0.95}
+\definecolor{codeblue}{rgb}{0.1,0.1,0.6}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  keywordstyle=\color{codeblue}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{teal},
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=2
+}
+
+\title{\textbf{OptiView Pro}\\Industrial Architecture \& Implementation Guide}
+\author{Software Architecture Handout}
+\date{Version 1.0 \;\;--\;\; \today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ------------------------------------------------------------
+\section{Introduction}
+OptiView Pro is an interactive decision-support dashboard for multi-objective optimization (MOO).
+Its core UX philosophy is \emph{Linked Dual-Space Understanding}: correlating design inputs 
+(\emph{Design Space}) with performance outcomes (\emph{Objective Space}) to enable intuitive trade-off exploration and confident selection of Pareto-optimal solutions.
+
+The customer requires a full-stack Python implementation with Streamlit, integrating an existing PyTorch model (either as a live object or a serialized file) plus feature-space ranges as inputs.
+
+% ------------------------------------------------------------
+\section{Scope and Goals}
+
+\subsection{Primary User Goals}
+\begin{itemize}[leftmargin=1.2em]
+  \item Identify Pareto-optimal solutions quickly.
+  \item Understand trade-offs across multiple objectives.
+  \item Link causes (inputs) to effects (objectives and ML predictions).
+  \item Filter and compare candidate solutions to make data-driven final choices.
+\end{itemize}
+
+\subsection{In-Scope Features}
+\begin{itemize}[leftmargin=1.2em]
+  \item Linked dashboard with four panels + right sidebar controls.
+  \item Design Space 2D prediction heatmap with decision boundary.
+  \item Objective Space interactive 3D scatter with Pareto emphasis and optional ghost cloud.
+  \item Parallel Coordinates for multi-dimensional filtering.
+  \item Inspector for exact values of hovered/selected points.
+  \item Two-way hover and selection linking, with optional visual linking line toggle.
+  \item Support for either precomputed MOO datasets or on-the-fly objective evaluation.
+\end{itemize}
+
+\subsection{Out-of-Scope (v1)}
+\begin{itemize}[leftmargin=1.2em]
+  \item Automated optimization algorithms (assumed to be run externally).
+  \item Collaborative real-time multi-user editing (read-only multi-user allowed).
+  \item Custom physics simulators beyond supplied objective hooks.
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Functional Requirements}
+
+\subsection{Dashboard Panels}
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Design Space (Top-Left)}:
+  \begin{itemize}
+    \item Render X1--X2 mesh grid heatmap showing $P(\text{Class A})$ from PyTorch model.
+    \item Overlay sampled design points.
+    \item Display decision boundary at probability threshold $p=0.5$ (dashed contour).
+    \item Hover a point to highlight corresponding point in Objective Space.
+    \item Box-brush selection filters/dims points in Objective Space and Parallel Coordinates.
+  \end{itemize}
+
+  \item \textbf{Objective Space (Top-Right)}:
+  \begin{itemize}
+    \item Interactive 3D scatter for ObjA, ObjB, ObjC.
+    \item Pareto points emphasized by size/brightness.
+    \item Discrete objective encoded by color/glyph.
+    \item Optional ghosted ``all possible points'' context cloud with opacity control.
+    \item Hover and selection linked bidirectionally with Design Space.
+  \end{itemize}
+
+  \item \textbf{Parallel Coordinates (Bottom-Left)}:
+  \begin{itemize}
+    \item Axes for all 4 objectives (3 continuous + 1 discrete).
+    \item Range brushing (or sidebar sliders fallback) updates global selection.
+  \end{itemize}
+
+  \item \textbf{Inspector (Bottom-Right)}:
+  \begin{itemize}
+    \item Table showing exact input values, objective values, and discrete class.
+    \item Shows hovered point and currently selected set.
+  \end{itemize}
+
+  \item \textbf{Right Sidebar Controls}:
+  \begin{itemize}
+    \item Toggle linking line on/off.
+    \item Discrete objective filter: \emph{Combined / Material A / Material B}.
+    \item Show/hide ghost cloud and opacity slider.
+    \item Mesh resolution and sampling controls.
+  \end{itemize}
+\end{enumerate}
+
+\subsection{Data Inputs}
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{Model Input}:
+  \begin{itemize}
+    \item PyTorch model object OR serialized model file (.pt/.pth).
+    \item Binary classification output (probability of class=1).
+  \end{itemize}
+  \item \textbf{Feature Space Ranges}:
+  \begin{itemize}
+    \item At minimum ranges for X1 and X2.
+    \item Optional additional dimensions for sampling if provided.
+  \end{itemize}
+  \item \textbf{Optional Dataset Upload}:
+  \begin{itemize}
+    \item CSV/Parquet with precomputed samples and objectives.
+  \end{itemize}
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Non-Functional Requirements}
+
+\subsection{Performance}
+\begin{itemize}[leftmargin=1.2em]
+  \item Grid inference for heatmap must complete within interactive latency (target $<$ 1s for $200\times200$ grid on CPU).
+  \item Dashboard remains responsive with up to $N=20{,}000$ samples; cloud downsample to $\leq 5{,}000$ for 3D rendering.
+  \item Use caching for model and derived data.
+\end{itemize}
+
+\subsection{Reliability}
+\begin{itemize}[leftmargin=1.2em]
+  \item Graceful handling of missing/invalid files.
+  \item Deterministic Pareto computation given objective arrays.
+  \item Reproducible sampling via stored random seeds.
+\end{itemize}
+
+\subsection{Security}
+\begin{itemize}[leftmargin=1.2em]
+  \item Uploaded models are treated as \textbf{trusted artifacts only}. 
+  Torch serialization uses pickle and can execute arbitrary code;
+  for untrusted environments accept only TorchScript/ONNX or \texttt{state\_dict} weights.
+  \item Limit file size, enforce extension whitelist, and validate schema.
+  \item Run behind HTTPS reverse proxy in production.
+\end{itemize}
+
+\subsection{Maintainability}
+\begin{itemize}[leftmargin=1.2em]
+  \item Clean separation into Presentation / Application / Domain / Infrastructure layers.
+  \item Pluggable interfaces for model predictors and objective evaluators.
+  \item Full unit-test coverage of Domain and Application layers.
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{System Architecture Overview}
+
+\subsection{High-Level Layers}
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Presentation Layer (UI)}: Streamlit layout, Plotly panels, sidebar, theming.
+  \item \textbf{Application Layer}: Coordinators managing session state, cross-filtering, caching, and orchestration.
+  \item \textbf{Domain Layer}: Sampling, objective evaluation, Pareto sorting, and data schema.
+  \item \textbf{Infrastructure Layer}: Model loading, persistence (local/S3/DB), logging, deployment.
+\end{enumerate}
+
+\subsection{Component Diagram (Textual)}
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{Streamlit App}: 
+    coordinates UI panels and reads/writes global state.
+  \item \textbf{State Store}: 
+    single source of truth for hover/selection/filtering/settings.
+  \item \textbf{Model Adapter}: 
+    normalizes inference for live or file-based PyTorch models.
+  \item \textbf{Sampler}: 
+    builds mesh grid and/or point samples from feature ranges.
+  \item \textbf{Objective Evaluator}: 
+    customer-provided function converting inputs to objectives.
+  \item \textbf{Pareto Engine}: 
+    computes non-dominated solutions.
+  \item \textbf{Data Source}: 
+    loads optional precomputed datasets.
+\end{itemize}
+
+\subsection{Data Flow}
+\begin{enumerate}[leftmargin=1.5em]
+  \item Load model and feature ranges.
+  \item Build mesh grid and compute model probabilities.
+  \item Load or sample design points.
+  \item Evaluate objectives (or read from dataset).
+  \item Compute Pareto mask.
+  \item Render panels.
+  \item User hover/selection updates State Store, re-renders linked views.
+\end{enumerate}
+
+% ------------------------------------------------------------
+\section{Module Design}
+
+\subsection{Repository Structure}
+\begin{verbatim}
+optiview_pro/
+|-- app.py
+|-- requirements.txt
+|-- core/
+|   |-- model_adapter.py
+|   |-- data_schema.py
+|   |-- sampling.py
+|   |-- objectives.py
+|   |-- pareto.py
+|   |-- filters.py
+|   +-- state.py
+|-- ui/
+|   |-- sidebar.py
+|   |-- panels/
+|   |   |-- design_space.py
+|   |   |-- objective_space.py
+|   |   |-- parallel_coords.py
+|   |   +-- inspector.py
+|   +-- theme.py
++-- utils/
+    |-- caching.py
+    |-- perf.py
+    +-- logging.py
+\end{verbatim}
+
+\subsection{Core Interfaces}
+
+\subsubsection{Model Predictor Protocol}
+\begin{lstlisting}[language=python]
+from typing import Protocol
+import numpy as np
+
+class IModelPredictor(Protocol):
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        """Return probability of class=1 for each row in x."""
+\end{lstlisting}
+
+\subsubsection{Objective Evaluator Protocol}
+\begin{lstlisting}[language=python]
+from typing import Protocol, Dict
+import numpy as np
+
+class IObjectiveEvaluator(Protocol):
+    def evaluate(self, x: np.ndarray, proba: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Return dict with keys: ObjA, ObjB, ObjC, Discrete.
+        Each value is shape (N,).
+        """
+\end{lstlisting}
+
+\subsubsection{DataFrame Contract}
+All downstream UI assumes a unified DataFrame:
+\[
+\texttt{df\_points}:\;
+\{id, X1, X2, ObjA, ObjB, ObjC, Discrete, is\_pareto\}
+\]
+
+\subsection{State Management}
+
+\subsubsection{State Store}
+\begin{lstlisting}[language=python]
+from dataclasses import dataclass, field
+from typing import Set, Optional, Dict, Any
+
+@dataclass
+class Filters:
+    selected_ids: Set[int] = field(default_factory=set)
+    hover_id: Optional[int] = None
+    discrete_filter: str = "Combined"
+    obj_ranges: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class UISettings:
+    show_link: bool = False
+    show_cloud: bool = True
+    cloud_opacity: float = 0.08
+    mesh_res: int = 200
+    sample_n: int = 2000
+
+@dataclass
+class AppState:
+    df_points: Any = None
+    grid: Dict[str, Any] = field(default_factory=dict)
+    filters: Filters = field(default_factory=Filters)
+    ui: UISettings = field(default_factory=UISettings)
+\end{lstlisting}
+
+\subsubsection{Session State Wiring}
+\begin{itemize}[leftmargin=1.2em]
+  \item Instantiate AppState once and store at \texttt{st.session\_state["state"]}.
+  \item Panels read from and write to this object only.
+  \item Any update triggers a re-render of all panels (Streamlit reactive model).
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Implementation Guide}
+
+\subsection{Model Adapter}
+\begin{lstlisting}[language=python]
+import torch
+import numpy as np
+
+class ModelAdapter:
+    def __init__(self, model=None, model_path=None, device="cpu"):
+        if model is None and model_path is None:
+            raise ValueError("Provide model or model_path.")
+        self.device = device
+        self.model = model or torch.load(model_path, map_location=device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        xt = torch.from_numpy(x).float().to(self.device)
+        logits = self.model(xt)
+
+        if logits.shape[-1] == 1:
+            proba = torch.sigmoid(logits).squeeze(-1)
+        else:
+            proba = torch.softmax(logits, dim=-1)[:, 1]
+
+        return proba.detach().cpu().numpy()
+\end{lstlisting}
+
+\subsection{Mesh Grid + Heatmap}
+\begin{lstlisting}[language=python]
+import numpy as np
+
+def make_mesh(x1_range, x2_range, res):
+    x1 = np.linspace(*x1_range, res)
+    x2 = np.linspace(*x2_range, res)
+    xx, yy = np.meshgrid(x1, x2)
+    grid_points = np.c_[xx.ravel(), yy.ravel()]
+    return xx, yy, grid_points
+\end{lstlisting}
+
+\subsection{Sampling Design Points}
+\begin{lstlisting}[language=python]
+def sample_points(ranges, n, seed=0):
+    rng = np.random.default_rng(seed)
+    X = np.zeros((n, len(ranges)))
+    for j, (lo, hi) in enumerate(ranges):
+        X[:, j] = rng.uniform(lo, hi, size=n)
+    return X
+\end{lstlisting}
+
+\subsection{Objective Evaluation Hook}
+This is customer-owned code. 
+\begin{lstlisting}[language=python]
+class ObjectiveEvaluator:
+    def evaluate(self, x, proba):
+        # TODO: replace with customer computation
+        ObjA = ...
+        ObjB = ...
+        ObjC = ...
+        Discrete = (proba >= 0.5).astype(int)
+        return dict(ObjA=ObjA, ObjB=ObjB, ObjC=ObjC, Discrete=Discrete)
+\end{lstlisting}
+
+\subsection{Pareto Front Computation}
+\begin{lstlisting}[language=python]
+import numpy as np
+
+def pareto_mask(F):
+    N = F.shape[0]
+    is_p = np.ones(N, dtype=bool)
+    for i in range(N):
+        if not is_p[i]:
+            continue
+        dom = np.all(F <= F[i], axis=1) & np.any(F < F[i], axis=1)
+        dom[i] = False
+        is_p[dom] = False
+    return is_p
+\end{lstlisting}
+
+\subsection{UI Panels}
+
+\subsubsection{Layout}
+\begin{lstlisting}[language=python]
+import streamlit as st
+from ui.sidebar import render_sidebar
+from ui.panels.design_space import render_design_space
+from ui.panels.objective_space import render_objective_space
+from ui.panels.parallel_coords import render_parallel_coords
+from ui.panels.inspector import render_inspector
+
+st.set_page_config(layout="wide")
+render_sidebar()
+
+tl, tr = st.columns(2)
+bl, br = st.columns(2)
+
+with tl: render_design_space()
+with tr: render_objective_space()
+with bl: render_parallel_coords()
+with br: render_inspector()
+\end{lstlisting}
+
+\subsubsection{Design Space (2D Heatmap + Brushing)}
+\begin{lstlisting}[language=python]
+import plotly.graph_objects as go
+from streamlit_plotly_events import plotly_events
+
+def render_design_space():
+    s = st.session_state["state"]
+    df, grid = s.df_points, s.grid
+    
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        x=grid["xx"][0], y=grid["yy"][:,0],
+        z=grid["prob"].reshape(grid["xx"].shape),
+        colorbar=dict(title="P(Class A)")
+    ))
+    fig.add_trace(go.Contour(
+        x=grid["xx"][0], y=grid["yy"][:,0],
+        z=grid["prob"].reshape(grid["xx"].shape),
+        contours=dict(start=0.5, end=0.5, size=1),
+        showscale=False,
+        line=dict(dash="dash", width=2),
+        name="Decision Boundary"
+    ))
+
+    selected = s.filters.selected_ids
+    colors = ["rgba(255,255,255,0.9)" if i in selected
+              else "rgba(255,255,255,0.3)" for i in df["id"]]
+
+    fig.add_trace(go.Scatter(
+        x=df["X1"], y=df["X2"], mode="markers",
+        marker=dict(size=6, color=colors),
+        customdata=df["id"], name="Samples"
+    ))
+
+    fig.update_layout(height=420, dragmode="select")
+    events = plotly_events(fig, hover_event=True, select_event=True,
+                           key="design_events")
+
+    if events:
+        e = events[-1]
+        if "customdata" in e:
+            s.filters.hover_id = int(e["customdata"])
+        if "selected_points" in e:
+            ids = {int(df.iloc[i]["id"]) for i in e["selected_points"]}
+            s.filters.selected_ids = ids
+
+    st.plotly_chart(fig, use_container_width=True)
+\end{lstlisting}
+
+\subsubsection{Objective Space (3D Scatter + Cloud)}
+\begin{lstlisting}[language=python]
+import plotly.graph_objects as go
+from streamlit_plotly_events import plotly_events
+
+def render_objective_space():
+    s = st.session_state["state"]
+    df = s.df_points
+
+    # Discrete filter
+    f = s.filters.discrete_filter
+    if f == "Material A Only":
+        dfv = df[df["Discrete"] == 0]
+    elif f == "Material B Only":
+        dfv = df[df["Discrete"] == 1]
+    else:
+        dfv = df
+
+    pareto = dfv[dfv["is_pareto"]]
+    cloud  = dfv[~dfv["is_pareto"]]
+
+    fig = go.Figure()
+    if s.ui.show_cloud:
+        fig.add_trace(go.Scatter3d(
+            x=cloud["ObjA"], y=cloud["ObjB"], z=cloud["ObjC"],
+            mode="markers",
+            marker=dict(size=2, opacity=s.ui.cloud_opacity, color="grey"),
+            customdata=cloud["id"], name="Cloud"
+        ))
+    fig.add_trace(go.Scatter3d(
+        x=pareto["ObjA"], y=pareto["ObjB"], z=pareto["ObjC"],
+        mode="markers",
+        marker=dict(size=6, opacity=0.95, color=pareto["Discrete"]),
+        customdata=pareto["id"], name="Pareto Front"
+    ))
+
+    fig.update_layout(height=420, scene=dict(
+        xaxis_title="ObjA", yaxis_title="ObjB", zaxis_title="ObjC"
+    ))
+
+    events = plotly_events(fig, hover_event=True, select_event=True,
+                           key="objective_events")
+
+    if events:
+        e = events[-1]
+        if "customdata" in e:
+            s.filters.hover_id = int(e["customdata"])
+        if "selected_points" in e:
+            ids = {int(dfv.iloc[i]["id"]) for i in e["selected_points"]}
+            s.filters.selected_ids = ids
+
+    st.plotly_chart(fig, use_container_width=True)
+\end{lstlisting}
+
+\subsubsection{Parallel Coordinates}
+\begin{lstlisting}[language=python]
+import plotly.graph_objects as go
+
+def render_parallel_coords():
+    s = st.session_state["state"]
+    df = s.df_points
+
+    fig = go.Figure(go.Parcoords(
+        line=dict(color=df["is_pareto"].astype(int), showscale=False),
+        dimensions=[
+            dict(label="ObjA", values=df["ObjA"]),
+            dict(label="ObjB", values=df["ObjB"]),
+            dict(label="ObjC", values=df["ObjC"]),
+            dict(label="Discrete", values=df["Discrete"])
+        ]
+    ))
+    fig.update_layout(height=360)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Industrial fallback for range filtering:
+    # add sidebar sliders bound to s.filters.obj_ranges
+\end{lstlisting}
+
+\subsubsection{Inspector}
+\begin{lstlisting}[language=python]
+def render_inspector():
+    s = st.session_state["state"]
+    df = s.df_points
+    hid = s.filters.hover_id
+    sel = s.filters.selected_ids
+
+    st.subheader("Details & Inspector")
+    if hid is not None:
+        st.markdown("**Hovered Point**")
+        st.dataframe(df[df["id"] == hid])
+
+    if sel:
+        st.markdown("**Selected Points**")
+        st.dataframe(df[df["id"].isin(sel)])
+\end{lstlisting}
+
+\subsection{Sidebar Controls}
+\begin{lstlisting}[language=python]
+def render_sidebar():
+    s = st.session_state["state"]
+
+    st.sidebar.header("Controls & Filters")
+    s.ui.show_link = st.sidebar.toggle("Show Linking Line", value=s.ui.show_link)
+    s.ui.show_cloud = st.sidebar.toggle("Show All Possible Points Cloud", value=s.ui.show_cloud)
+    s.ui.cloud_opacity = st.sidebar.slider("Feasibility Cloud Opacity",
+                                          0.0, 0.2, s.ui.cloud_opacity)
+
+    s.filters.discrete_filter = st.sidebar.radio(
+        "Discrete Objective Filter",
+        ["Combined", "Material A Only", "Material B Only"],
+        index=["Combined","Material A Only","Material B Only"].index(s.filters.discrete_filter)
+    )
+
+    s.ui.mesh_res = st.sidebar.slider("Mesh Resolution", 50, 400, s.ui.mesh_res)
+    s.ui.sample_n = st.sidebar.slider("Sample Size", 100, 20000, s.ui.sample_n)
+
+    if st.sidebar.button("Recompute"):
+        st.session_state["recompute_flag"] = True
+\end{lstlisting}
+
+% ------------------------------------------------------------
+\section{Caching and Performance Engineering}
+
+\subsection{Caching Strategy}
+\begin{itemize}[leftmargin=1.2em]
+  \item \texttt{st.cache\_resource}: model loading.
+  \item \texttt{st.cache\_data}: mesh inference, objective evaluation, Pareto mask.
+  \item Cache keys incorporate: model hash, mesh\_res, sample\_n, seed, objective config.
+\end{itemize}
+
+\subsection{Downsampling Strategy}
+\begin{itemize}[leftmargin=1.2em]
+  \item If $N_{\text{cloud}} > 50k$, sample uniformly to $5k$ for 3D panel.
+  \item Preserve all Pareto points (never downsample Pareto).
+\end{itemize}
+
+\subsection{GPU Optionality}
+If CUDA is available, allow user to enable GPU inference via device toggle. 
+Always batch grid inference to avoid memory spikes.
+
+% ------------------------------------------------------------
+\section{Persistence, Export, and Reproducibility}
+
+\subsection{Session Export}
+Provide a download button for:
+\begin{itemize}[leftmargin=1.2em]
+  \item Full dataset with Pareto flag.
+  \item Selected subset only.
+  \item JSON snapshot of filters + UI settings.
+\end{itemize}
+
+\subsection{Reproducibility}
+Store the following in any exported snapshot:
+\begin{itemize}[leftmargin=1.2em]
+  \item Random seed used for sampling.
+  \item Model identifier/hash.
+  \item Objective-evaluator version string.
+  \item Feature ranges and mesh resolution.
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Testing Strategy}
+
+\subsection{Unit Tests}
+\begin{itemize}[leftmargin=1.2em]
+  \item Pareto correctness (known dominated/non-dominated sets).
+  \item Objective evaluator contract (shape/type checks).
+  \item Sampling bounds tests.
+  \item Model adapter probability range $\in [0,1]$.
+\end{itemize}
+
+\subsection{Integration Tests}
+\begin{itemize}[leftmargin=1.2em]
+  \item End-to-end pipeline: model $\to$ grid $\to$ objectives $\to$ Pareto $\to$ DataFrame.
+  \item Regression snapshot tests for DataFrame schema.
+\end{itemize}
+
+\subsection{UI Smoke Tests}
+Automated Playwright tests:
+\begin{itemize}[leftmargin=1.2em]
+  \item Page loads without error.
+  \item Sidebar recompute triggers.
+  \item Plot panels render non-empty traces.
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Deployment}
+
+\subsection{Docker}
+\begin{lstlisting}[language=bash]
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+EXPOSE 8501
+CMD ["streamlit", "run", "app.py",
+     "--server.address=0.0.0.0", "--server.port=8501"]
+\end{lstlisting}
+
+\subsection{Production Topology}
+\begin{itemize}[leftmargin=1.2em]
+  \item Nginx reverse proxy for TLS termination and gzip compression.
+  \item Horizontal scaling via container replicas (stateless UI).
+  \item Shared persistence (S3/DB) for datasets and exports.
+\end{itemize}
+
+\subsection{Observability}
+\begin{itemize}[leftmargin=1.2em]
+  \item Structured logs (JSON) for model load, inference times, recompute events.
+  \item Optional Prometheus metrics endpoint for compute latency, active sessions.
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Roadmap}
+
+\subsection{v1.1 Enhancements}
+\begin{itemize}[leftmargin=1.2em]
+  \item Custom Streamlit component for true parcoords brushing events.
+  \item Advanced Pareto layers (epsilon dominance, crowding distance).
+  \item Saved ``analysis workspaces'' for quick reopening.
+\end{itemize}
+
+\subsection{v2.0 Scalability}
+\begin{itemize}[leftmargin=1.2em]
+  \item Optional FastAPI compute backend + job queue for heavy simulations.
+  \item Multi-user collaboration (shared read-only sessions).
+  \item Role-based access control.
+\end{itemize}
+
+% ------------------------------------------------------------
+\section{Conclusion}
+This handout provides a complete industrial-grade blueprint to implement OptiView Pro in Streamlit with pluggable PyTorch model inference, objective evaluation, Pareto computation, and deeply linked interactive visual analytics.
+
+\end{document}

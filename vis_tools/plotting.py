@@ -1,5 +1,4 @@
-﻿
-"""
+﻿"""
 Visualization helpers.
 """
 
@@ -14,6 +13,9 @@ from matplotlib import cm
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.inspection import DecisionBoundaryDisplay
 from torch import nn
+
+import plotly.graph_objects as go
+import plotly.express as px
 
 
 Array = np.ndarray
@@ -236,3 +238,139 @@ def plot_proba(
     fig.colorbar(disp.surface_, ax=ax, label="Probability")
     _decorate_axis(ax)
     return fig, ax
+
+
+def get_design_space_fig(
+    torch_model: nn.Module,
+    X: Array,
+    Y: Optional[Array] = None,
+    x_star: Optional[Array] = None,
+    pareto_X: Optional[Array] = None,
+    grid_resolution: int = 100,
+    device=None
+) -> go.Figure:
+    """
+    Generates a Plotly figure for the Design Space (Input Space).
+    Includes:
+    - Probability Heatmap/Contour
+    - Decision Boundary
+    - Sampled Points (X, Y)
+    - x* (Factual)
+    - Pareto Set (Counterfactuals)
+    """
+    X = np.asarray(X)
+    
+    # 1. Create Grid & Predict
+    x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
+    y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
+    
+    xx, yy = np.meshgrid(
+        np.linspace(x_min, x_max, grid_resolution),
+        np.linspace(y_min, y_max, grid_resolution)
+    )
+    grid_points = np.c_[xx.ravel(), yy.ravel()]
+    
+    est = TorchProbaEstimator(torch_model, device=device)
+    est.fit(X, Y) # Fit to get classes
+    
+    # Predict probabilities for class 1 (assuming binary)
+    probas = est.predict_proba(grid_points)
+    # Assuming class 1 is the target or interesting one. 
+    if probas.shape[1] == 2:
+        Z = probas[:, 1].reshape(xx.shape)
+    else:
+        Z = probas[:, 1].reshape(xx.shape)
+
+    fig = go.Figure()
+
+    # 2. Contour / Heatmap
+    fig.add_trace(go.Contour(
+        z=Z,
+        x=np.linspace(x_min, x_max, grid_resolution),
+        y=np.linspace(y_min, y_max, grid_resolution),
+        colorscale='RdBu_r', # Diverging Red-Blue (Red=High Prob)
+        opacity=0.6,
+        contours=dict(
+            start=0,
+            end=1,
+            size=0.1,
+            showlines=False
+        ),
+        name='Probability',
+        hoverinfo='skip' # Reduce clutter
+    ))
+    
+    # 3. Decision Boundary (Line at 0.5)
+    fig.add_trace(go.Contour(
+        z=Z,
+        x=np.linspace(x_min, x_max, grid_resolution),
+        y=np.linspace(y_min, y_max, grid_resolution),
+        contours=dict(
+            type='constraint',
+            operation='=',
+            value=0.5,
+        ),
+        line=dict(color='white', width=3, dash='dash'),
+        showscale=False,
+        name='Decision Boundary',
+        hoverinfo='skip'
+    ))
+
+    # 4. Sampled Points
+    if Y is not None:
+        # Split by class
+        for c in np.unique(Y):
+            mask = Y == c
+            # We need original indices for linking
+            indices = np.where(mask)[0]
+            
+            fig.add_trace(go.Scatter(
+                x=X[mask, 0],
+                y=X[mask, 1],
+                mode='markers',
+                marker=dict(
+                    size=8,
+                    color='orange' if c==1 else 'blue',
+                    line=dict(width=1, color='black')
+                ),
+                name=f'Class {c}',
+                customdata=indices, # Store index for linking
+                hovertemplate='Index: %{customdata}<br>x1: %{x:.2f}<br>x2: %{y:.2f}'
+            ))
+
+    # 5. x* (Factual)
+    if x_star is not None:
+        fig.add_trace(go.Scatter(
+            x=[x_star[0]],
+            y=[x_star[1]],
+            mode='markers',
+            marker=dict(size=15, color='red', symbol='star'),
+            name='x* (Factual)',
+            hoverinfo='name+x+y'
+        ))
+
+    # 6. Pareto Set
+    if pareto_X is not None:
+        # Indices for Pareto points? They are new points, so maybe index -1 or separate range
+        # We can assign them indices starting from len(X)
+        pareto_indices = np.arange(len(X), len(X) + len(pareto_X))
+        
+        fig.add_trace(go.Scatter(
+            x=pareto_X[:, 0],
+            y=pareto_X[:, 1],
+            mode='markers',
+            marker=dict(size=10, color='cyan', symbol='x'),
+            name='Pareto Set',
+            customdata=pareto_indices,
+            hovertemplate='Pareto Idx: %{customdata}<br>x1: %{x:.2f}<br>x2: %{y:.2f}'
+        ))
+
+    fig.update_layout(
+        xaxis_title="x1",
+        yaxis_title="x2",
+        margin=dict(l=0, r=0, b=0, t=30),
+        height=500,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    return fig
