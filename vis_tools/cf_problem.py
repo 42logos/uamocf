@@ -13,7 +13,7 @@ import torch
 from pymoo.problems.functional import FunctionalProblem
 from torch import nn
 
-from .uncertainty import aleatoric_from_models, total_uncertainty
+from .uncertainty import aleatoric_from_models, total_uncertainty, total_uncertainty_ensemble
 
 Array = np.ndarray
 
@@ -99,9 +99,9 @@ def make_cf_problem(
         return aleatoric_from_models(ensemble, x, device)
 
     def o6_epistemic_uncertainty(x: Array) -> float:
-        if bayesian_model is None or ensemble is None:
-            raise ValueError("Bayesian model and ensemble must be provided for epistemic uncertainty.")
-        total = total_uncertainty(bayesian_model, x, device)
+        if ensemble is None:
+            raise ValueError("Ensemble must be provided for epistemic uncertainty.")
+        total = total_uncertainty_ensemble(ensemble, x, device)
         alea = o5_aleatoric_uncertainty(x)
         return total - alea
 

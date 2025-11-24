@@ -93,6 +93,7 @@ def train_model(
     X: Array,
     y: Array,
     cfg: TrainConfig,
+    callback: Optional[Callable[[int, float], None]] = None
 ) -> TrainResult:
     device = cfg.resolve_device()
     model = model.to(device)
@@ -104,7 +105,7 @@ def train_model(
     history: List[float] = []
     progress_iter = tqdm(range(cfg.epochs), desc="Training", ncols=80, unit="epoch", disable=not cfg.progress)
 
-    for _ in progress_iter:
+    for epoch in progress_iter:
         model.train()
         running_loss = 0.0
 
@@ -120,6 +121,9 @@ def train_model(
         epoch_loss = running_loss / len(train_loader.dataset)
         history.append(epoch_loss)
         progress_iter.set_postfix({"Train Loss": epoch_loss})
+        
+        if callback:
+            callback(epoch, epoch_loss)
 
     model.eval()
     val_loss = 0.0
@@ -154,6 +158,7 @@ def train_ensemble(
     cfg: TrainConfig,
     model_factory: Callable[[], nn.Module] = lambda: SimpleNN(),
     resample_fn: Optional[Callable[[int], Tuple[Array, Array]]] = None,
+    callback: Optional[Callable[[int, int, float], None]] = None
 ) -> List[TrainResult]:
     """
     Train multiple models on (possibly re-sampled) data.
@@ -165,6 +170,11 @@ def train_ensemble(
         run_cfg.seed = None if cfg.seed is None else cfg.seed + idx
 
         Xi, yi = (X, y) if resample_fn is None else resample_fn(idx)
-        res = train_model(model, Xi, yi, run_cfg)
+        
+        def model_cb(epoch, loss):
+            if callback:
+                callback(idx, epoch, loss)
+                
+        res = train_model(model, Xi, yi, run_cfg, callback=model_cb)
         results.append(res)
     return results

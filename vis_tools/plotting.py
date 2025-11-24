@@ -17,6 +17,8 @@ from torch import nn
 import plotly.graph_objects as go
 import plotly.express as px
 
+from . import uncertainty
+
 
 Array = np.ndarray
 
@@ -247,7 +249,18 @@ def get_design_space_fig(
     x_star: Optional[Array] = None,
     pareto_X: Optional[Array] = None,
     grid_resolution: int = 100,
-    device=None
+    device=None,
+    sampled_size: int = 8,
+    pareto_size: int = 10,
+    x_star_size: int = 15,
+    dragmode: str = 'zoom',
+    x_range: Optional[tuple] = None,
+    y_range: Optional[tuple] = None,
+    background_type: str = "Probability",
+    models: Optional[Sequence[nn.Module]] = None,
+    n_contours: int = 20,
+    X_indices: Optional[Array] = None,
+    pareto_indices: Optional[Array] = None
 ) -> go.Figure:
     """
     Generates a Plotly figure for the Design Space (Input Space).
@@ -260,9 +273,20 @@ def get_design_space_fig(
     """
     X = np.asarray(X)
     
+    # Default indices if not provided
+    if X_indices is None:
+        X_indices = np.arange(len(X))
+    
     # 1. Create Grid & Predict
-    x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
-    y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
+    if x_range is not None:
+        x_min, x_max = x_range
+    else:
+        x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
+        
+    if y_range is not None:
+        y_min, y_max = y_range
+    else:
+        y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
     
     xx, yy = np.meshgrid(
         np.linspace(x_min, x_max, grid_resolution),
@@ -270,66 +294,121 @@ def get_design_space_fig(
     )
     grid_points = np.c_[xx.ravel(), yy.ravel()]
     
-    est = TorchProbaEstimator(torch_model, device=device)
-    est.fit(X, Y) # Fit to get classes
-    
-    # Predict probabilities for class 1 (assuming binary)
-    probas = est.predict_proba(grid_points)
-    # Assuming class 1 is the target or interesting one. 
-    if probas.shape[1] == 2:
-        Z = probas[:, 1].reshape(xx.shape)
-    else:
-        Z = probas[:, 1].reshape(xx.shape)
+    Z = None
+    colorscale = 'RdBu_r'
+    zmin, zmax = 0.0, 1.0
+    colorbar_title = "Prob"
+
+    if background_type == "Probability":
+        est = TorchProbaEstimator(torch_model, device=device)
+        est.fit(X, Y) # Fit to get classes
+        probas = est.predict_proba(grid_points)
+        if probas.shape[1] == 2:
+            Z = probas[:, 1].reshape(xx.shape)
+        else:
+            Z = probas[:, 1].reshape(xx.shape)
+        colorscale = 'RdBu_r'
+        colorbar_title = "Prob"
+        
+    elif background_type == "Aleatoric Uncertainty":
+        if models is None:
+            # Fallback if no ensemble
+            Z = np.zeros_like(xx)
+        else:
+            au = uncertainty.aleatoric_from_models(models, grid_points, device)
+            Z = au.reshape(xx.shape)
+        colorscale = 'Viridis'
+        zmin, zmax = None, None
+        colorbar_title = "AU"
+        
+    elif background_type == "Epistemic Uncertainty":
+        if models is None:
+            Z = np.zeros_like(xx)
+        else:
+            eu = uncertainty.epistemic_from_models(models, grid_points, device)
+            Z = eu.reshape(xx.shape)
+        colorscale = 'Plasma'
+        zmin, zmax = None, None
+        colorbar_title = "EU"
 
     fig = go.Figure()
 
     # 2. Contour / Heatmap
-    fig.add_trace(go.Contour(
-        z=Z,
-        x=np.linspace(x_min, x_max, grid_resolution),
-        y=np.linspace(y_min, y_max, grid_resolution),
-        colorscale='RdBu_r', # Diverging Red-Blue (Red=High Prob)
-        opacity=0.6,
-        contours=dict(
-            start=0,
-            end=1,
-            size=0.1,
-            showlines=False
-        ),
-        name='Probability',
-        hoverinfo='skip' # Reduce clutter
-    ))
+    if Z is not None and background_type != "None":
+        # Calculate contour size based on range and n_contours
+        if zmin is not None and zmax is not None:
+            c_start, c_end = zmin, zmax
+        else:
+            c_start, c_end = Z.min(), Z.max()
+            
+        if c_end > c_start:
+            c_size = (c_end - c_start) / n_contours
+        else:
+            c_size = 0.1
+
+        contour_kwargs = dict(
+            z=Z,
+            x=np.linspace(x_min, x_max, grid_resolution),
+            y=np.linspace(y_min, y_max, grid_resolution),
+            colorscale=colorscale,
+            opacity=0.6,
+            contours=dict(
+                start=c_start,
+                end=c_end,
+                size=c_size,
+                showlines=False
+            ),
+            colorbar=dict(
+                title=colorbar_title,
+                thickness=15,
+                len=0.5,
+                x=1.05,
+                y=0.5
+            ),
+            name=background_type,
+            hoverinfo='skip'
+        )
+        
+        if zmin is not None:
+            contour_kwargs['zmin'] = zmin
+            contour_kwargs['zmax'] = zmax
+            
+        fig.add_trace(go.Contour(**contour_kwargs))
     
-    # 3. Decision Boundary (Line at 0.5)
-    fig.add_trace(go.Contour(
-        z=Z,
-        x=np.linspace(x_min, x_max, grid_resolution),
-        y=np.linspace(y_min, y_max, grid_resolution),
-        contours=dict(
-            type='constraint',
-            operation='=',
-            value=0.5,
-        ),
-        line=dict(color='white', width=3, dash='dash'),
-        showscale=False,
-        name='Decision Boundary',
-        hoverinfo='skip'
-    ))
+    # 3. Decision Boundary (Line at 0.5) - Only for Probability
+    if background_type == "Probability" and Z is not None:
+        fig.add_trace(go.Contour(
+            z=Z,
+            x=np.linspace(x_min, x_max, grid_resolution),
+            y=np.linspace(y_min, y_max, grid_resolution),
+            contours=dict(
+                type='constraint',
+                operation='=',
+                value=0.5,
+            ),
+            line=dict(color='white', width=3, dash='dash'),
+            showscale=False,
+            name='Decision Boundary',
+            hoverinfo='skip'
+        ))
 
     # 4. Sampled Points
     if Y is not None:
         # Split by class
         for c in np.unique(Y):
             mask = Y == c
-            # We need original indices for linking
-            indices = np.where(mask)[0]
+            # Use provided indices if available, else calculate relative
+            if X_indices is not None:
+                indices = X_indices[mask]
+            else:
+                indices = np.where(mask)[0]
             
             fig.add_trace(go.Scatter(
                 x=X[mask, 0],
                 y=X[mask, 1],
                 mode='markers',
                 marker=dict(
-                    size=8,
+                    size=sampled_size,
                     color='orange' if c==1 else 'blue',
                     line=dict(width=1, color='black')
                 ),
@@ -344,24 +423,27 @@ def get_design_space_fig(
             x=[x_star[0]],
             y=[x_star[1]],
             mode='markers',
-            marker=dict(size=15, color='red', symbol='star'),
+            marker=dict(size=x_star_size, color='red', symbol='star'),
             name='x* (Factual)',
             hoverinfo='name+x+y'
         ))
 
     # 6. Pareto Set
     if pareto_X is not None:
-        # Indices for Pareto points? They are new points, so maybe index -1 or separate range
-        # We can assign them indices starting from len(X)
-        pareto_indices = np.arange(len(X), len(X) + len(pareto_X))
+        # Use provided indices if available
+        if pareto_indices is not None:
+            p_indices = pareto_indices
+        else:
+            # Fallback: assume appended
+            p_indices = np.arange(len(X), len(X) + len(pareto_X))
         
         fig.add_trace(go.Scatter(
             x=pareto_X[:, 0],
             y=pareto_X[:, 1],
             mode='markers',
-            marker=dict(size=10, color='cyan', symbol='x'),
+            marker=dict(size=pareto_size, color='cyan', symbol='x'),
             name='Pareto Set',
-            customdata=pareto_indices,
+            customdata=p_indices,
             hovertemplate='Pareto Idx: %{customdata}<br>x1: %{x:.2f}<br>x2: %{y:.2f}'
         ))
 
@@ -370,7 +452,14 @@ def get_design_space_fig(
         yaxis_title="x2",
         margin=dict(l=0, r=0, b=0, t=30),
         height=500,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        dragmode=dragmode,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5
+        )
     )
     
     return fig

@@ -1,5 +1,4 @@
-﻿
-"""
+﻿"""
 Uncertainty utilities: entropy, aleatoric, and epistemic calculations.
 """
 
@@ -18,8 +17,9 @@ def entropy(probs: Array) -> Array:
     """
     Compute Shannon entropy for probabilities along the last dimension.
     """
-    probs = np.clip(probs, 1e-12, 1.0)
-    return -np.sum(probs * np.log(probs), axis=-1)
+    # probs = np.clip(probs, 1e-12, 1.0)
+    # return -np.sum(probs * np.log(probs), axis=-1)
+    return -np.sum(probs * np.log(probs + 1e-12), axis=-1)
 
 
 def softmax_logits(logits: torch.Tensor) -> Array:
@@ -78,3 +78,46 @@ def total_uncertainty(model: nn.Module, x: Array, device: torch.device) -> Union
     if not is_batch:
         return float(ent[0])
     return ent
+
+
+def total_uncertainty_ensemble(models: Sequence[nn.Module], x: Array, device: torch.device) -> Union[float, Array]:
+    """
+    Entropy of the mean predictive distribution from an ensemble.
+    Represents Total Uncertainty.
+    """
+    x = np.asarray(x)
+    is_batch = x.ndim > 1
+    if not is_batch:
+        x = x[None, :]
+        
+    x_t = torch.from_numpy(x.astype(np.float32)).to(device)
+    
+    # Collect probabilities from all models
+    all_probs = []
+    with torch.no_grad():
+        for m in models:
+            logits = m(x_t)
+            probs = torch.softmax(logits, dim=-1)
+            all_probs.append(probs)
+            
+    # Stack: (n_models, N, n_classes)
+    all_probs = torch.stack(all_probs)
+    
+    # Average probability across models
+    mean_probs = torch.mean(all_probs, dim=0).cpu().numpy() # (N, n_classes)
+    
+    # Entropy of the mean
+    ent = entropy(mean_probs) # (N,)
+    
+    if not is_batch:
+        return float(ent[0])
+    return ent
+
+
+def epistemic_from_models(models: Sequence[nn.Module], x: Array, device: torch.device) -> Union[float, Array]:
+    """
+    Epistemic Uncertainty = Total Uncertainty - Aleatoric Uncertainty.
+    """
+    tu = total_uncertainty_ensemble(models, x, device)
+    au = aleatoric_from_models(models, x, device)
+    return tu - au
