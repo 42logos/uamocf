@@ -87,7 +87,7 @@ with st.sidebar.expander("System Configuration", expanded=False):
     
     st.subheader("Model Training")
     n_epochs = st.slider("Epochs", 10, 200, 50)
-    ensemble_size = st.slider("Ensemble Size", 1, 10, 3)
+    ensemble_size = st.slider("Ensemble Size", 1, 100, 3)
     
     st.subheader("Search Parameters")
     c1, c2 = st.columns(2)
@@ -176,15 +176,25 @@ with st.sidebar.expander("Range & Filters", expanded=True):
             obj_names = ["Validity", "Epistemic", "Sparsity", "Aleatoric"]
             
             for i, name in enumerate(obj_names):
-                v_min = float(F_combined[:, i].min())
-                v_max = float(F_combined[:, i].max())
-                # Add a small buffer to min/max to ensure points on boundary are included
-                # or just use the exact values.
-                if v_min < v_max:
-                    obj_filters[name] = st.slider(f"{name} Range", v_min, v_max, (v_min, v_max))
+                col_values = F_combined[:, i]
+                if name == "Sparsity":
+                    # Discrete handling for Sparsity
+                    unique_vals = np.unique(col_values)
+                    unique_vals = np.sort(unique_vals)
+                    options = unique_vals.tolist()
+                    # Use multiselect for discrete values
+                    selected = st.multiselect(f"{name} Values", options, default=options)
+                    obj_filters[name] = selected
                 else:
-                    st.write(f"{name}: {v_min:.4f}")
-                    obj_filters[name] = (v_min, v_max)
+                    v_min = float(col_values.min())
+                    v_max = float(col_values.max())
+                    # Add a small buffer to min/max to ensure points on boundary are included
+                    # or just use the exact values.
+                    if v_min < v_max:
+                        obj_filters[name] = st.slider(f"{name} Range", v_min, v_max, (v_min, v_max))
+                    else:
+                        st.write(f"{name}: {v_min:.4f}")
+                        obj_filters[name] = (v_min, v_max)
 
 # --- Helper Functions ---
 def get_indices_from_selection(selection):
@@ -207,8 +217,14 @@ def filter_mask(F_data, filters):
     obj_names = ["Validity", "Epistemic", "Sparsity", "Aleatoric"]
     for i, name in enumerate(obj_names):
         if name in filters:
-            min_v, max_v = filters[name]
-            mask &= (F_data[:, i] >= min_v) & (F_data[:, i] <= max_v)
+            val = filters[name]
+            if isinstance(val, list):
+                # Discrete filtering (e.g. for Sparsity)
+                mask &= np.isin(F_data[:, i], val)
+            else:
+                # Range filtering (tuple)
+                min_v, max_v = val
+                mask &= (F_data[:, i] >= min_v) & (F_data[:, i] <= max_v)
     return mask
 
 # --- Global Selection Logic ---
@@ -231,7 +247,10 @@ if curr_design_sel != st.session_state.last_design_select:
             st.session_state.global_indices.update(new_indices)
     else:
         # Replace (Select Mode)
-        st.session_state.global_indices = set(new_indices)
+        # Only replace if we have a valid selection. 
+        # This prevents clearing selection when the plot re-renders (which might reset selection state).
+        if new_indices:
+            st.session_state.global_indices = set(new_indices)
     st.session_state.last_design_select = curr_design_sel
 
 # Update from Objective Space
@@ -245,7 +264,8 @@ if curr_obj_sel != st.session_state.last_obj_select:
         if new_indices:
             st.session_state.global_indices.update(new_indices)
     else:
-        st.session_state.global_indices = set(new_indices)
+        if new_indices:
+            st.session_state.global_indices = set(new_indices)
     st.session_state.last_obj_select = curr_obj_sel
 
 # --- Main Layout ---
@@ -450,7 +470,7 @@ with col_design:
             height=PANEL_HEIGHT
         )
         
-        # Add Highlights
+        # Add Highlights (Global Selection)
         if highlight_indices:
             # Gather points to highlight
             # Indices < len(X) are Observed
@@ -496,9 +516,43 @@ with col_design:
                     name='Linked Selection',
                     hoverinfo='skip'
                 ))
-                if show_linking:
-                    # Simulate linking line by drawing a line to a fixed point or just text
-                    pass
+
+        # Add Table Highlights (Secondary Selection)
+        if "table_selection" in st.session_state and st.session_state.table_selection:
+            table_indices = list(st.session_state.table_selection)
+            N = len(X)
+            tbl_X = []
+            tbl_Y = []
+            
+            # Check Observed
+            obs_indices = [i for i in table_indices if i < N]
+            if obs_indices:
+                if mask_obs is not None:
+                    obs_indices = [i for i in obs_indices if mask_obs[i]]
+                if obs_indices:
+                    tbl_X.extend(X[obs_indices, 0])
+                    tbl_Y.extend(X[obs_indices, 1])
+            
+            # Check Pareto
+            if st.session_state.cf_results is not None:
+                X_cf = st.session_state.cf_results.X
+                if X_cf is not None:
+                    par_indices = [i - N for i in table_indices if i >= N]
+                    if par_indices:
+                        if mask_par is not None:
+                            par_indices = [i for i in par_indices if mask_par[i]]
+                        if par_indices:
+                            tbl_X.extend(X_cf[par_indices, 0])
+                            tbl_Y.extend(X_cf[par_indices, 1])
+            
+            if tbl_X:
+                fig1.add_trace(go.Scatter(
+                    x=tbl_X, y=tbl_Y,
+                    mode='markers',
+                    marker=dict(size=14, color='cyan', line=dict(width=3, color='blue'), symbol='circle'),
+                    name='Table Selection',
+                    hoverinfo='skip'
+                ))
 
         st.plotly_chart(fig1, on_select="rerun", selection_mode=sel_mode_2d, key="design_select", config={'displayModeBar': True}, use_container_width=True)
     else:
@@ -594,7 +648,7 @@ with col_obj:
                 name='x* (Reference)'
             ))
             
-            # 4. Highlights
+            # 4. Highlights (Global Selection)
             if highlight_indices:
                 high_x, high_y, high_z = [], [], []
                 
@@ -619,6 +673,35 @@ with col_obj:
                         mode='markers',
                         marker=dict(size=10, color='yellow', line=dict(width=5, color='black'), symbol='circle-open'),
                         name='Linked Selection',
+                        hoverinfo='skip'
+                    ))
+
+            # 5. Table Highlights (Secondary Selection)
+            if "table_selection" in st.session_state and st.session_state.table_selection:
+                table_indices = list(st.session_state.table_selection)
+                tbl_x, tbl_y, tbl_z = [], [], []
+                
+                # Check Observed
+                if st.session_state.F_obs is not None:
+                    obs_idxs = [i for i in table_indices if i < N]
+                    if obs_idxs:
+                        tbl_x.extend(st.session_state.F_obs[obs_idxs, 1])
+                        tbl_y.extend(st.session_state.F_obs[obs_idxs, 0])
+                        tbl_z.extend(st.session_state.F_obs[obs_idxs, 3])
+                
+                # Check Pareto
+                par_idxs = [i - N for i in table_indices if i >= N]
+                if par_idxs:
+                    tbl_x.extend(F[par_idxs, 1])
+                    tbl_y.extend(F[par_idxs, 0])
+                    tbl_z.extend(F[par_idxs, 3])
+                
+                if tbl_x:
+                    fig_3d.add_trace(go.Scatter3d(
+                        x=tbl_x, y=tbl_y, z=tbl_z,
+                        mode='markers',
+                        marker=dict(size=12, color='cyan', line=dict(width=5, color='blue'), symbol='circle'),
+                        name='Table Selection',
                         hoverinfo='skip'
                     ))
 
@@ -769,9 +852,15 @@ with col_det:
             # Columns in df_details are full names: Validity, Epistemic, Sparsity, Aleatoric
             
             mask_details = np.ones(len(df_details), dtype=bool)
-            for name, (min_v, max_v) in obj_filters.items():
+            for name, val in obj_filters.items():
                 if name in df_details.columns:
-                    mask_details &= (df_details[name] >= min_v) & (df_details[name] <= max_v)
+                    if isinstance(val, list):
+                        # Discrete filtering
+                        mask_details &= df_details[name].isin(val)
+                    else:
+                        # Range filtering
+                        min_v, max_v = val
+                        mask_details &= (df_details[name] >= min_v) & (df_details[name] <= max_v)
             
             df_details = df_details[mask_details]
 
@@ -785,14 +874,38 @@ with col_det:
             df_details.rename(columns=rename_map, inplace=True)
             
             # Columns to show (Reduced set)
-            cols = ["Type", "x1", "x2", "Val", "Epi", "Spar", "Ale"]
+            cols = ["Index", "Type", "x1", "x2", "Val", "Epi", "Spar", "Ale"]
             # Filter if they exist
             cols = [c for c in cols if c in df_details.columns]
             
-            st.dataframe(
+            # Display with selection
+            selection = st.dataframe(
                 df_details[cols].style.format("{:.4f}", subset=[c for c in cols if c not in ["Type", "Index"]]), 
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key="details_table_view",
+                hide_index=True,
                 height=PANEL_HEIGHT
             )
+
+            # Handle table selection
+            if len(selection.selection.rows) > 0:
+                # Map selected rows back to global indices
+                # Note: selection.selection.rows are indices into the *displayed* dataframe (df_details[cols])
+                # We need to get the "Index" column from the corresponding rows
+                selected_indices = df_details.iloc[selection.selection.rows]["Index"].values.tolist()
+                
+                # Update TABLE selection state (Secondary Selection)
+                new_set = set(selected_indices)
+                if "table_selection" not in st.session_state or new_set != st.session_state.table_selection:
+                    st.session_state.table_selection = new_set
+                    st.rerun()
+            else:
+                # Clear table selection if nothing selected
+                if "table_selection" in st.session_state and st.session_state.table_selection:
+                    st.session_state.table_selection = set()
+                    st.rerun()
         else:
             st.warning("Selected indices out of range.")
 
