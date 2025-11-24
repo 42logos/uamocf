@@ -18,7 +18,7 @@ from vis_tools import data, models, training, uncertainty, cf_problem, plotting,
 
 PANEL_HEIGHT = 500
 
-st.set_page_config(page_title="OptiView Pro", layout="wide")
+st.set_page_config(page_title="uamocf: Uncertainty-Aware Multi-Objective Counterfactuals", layout="wide")
 
 # --- Session State ---
 if "data" not in st.session_state:
@@ -31,7 +31,6 @@ if "F_obs" not in st.session_state:
     st.session_state.F_obs = None
 
 # --- Sidebar Controls ---
-st.sidebar.title("OptiView Pro")
 
 # 1. Interaction (Top Priority)
 st.sidebar.header("Interaction")
@@ -269,7 +268,7 @@ if curr_obj_sel != st.session_state.last_obj_select:
     st.session_state.last_obj_select = curr_obj_sel
 
 # --- Main Layout ---
-st.title("OptiView Pro: Linked Dual-Space Exploration")
+st.title("uamocf: Uncertainty-Aware Multi-Objective Counterfactuals")
 
 # Top Row: Design Space & Objective Space
 col_design, col_obj = st.columns([1, 1])
