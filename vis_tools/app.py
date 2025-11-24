@@ -287,6 +287,7 @@ if st.sidebar.button("Initialize System (Gen Data + Train)"):
     # Clear previous results
     st.session_state.cf_results = None
     st.session_state.F_obs = None
+    st.session_state.F_star = None
     
     # 2. Train Model
     train_cfg = training.TrainConfig(
@@ -392,6 +393,11 @@ if st.sidebar.button("Run Counterfactual Search"):
         with st.spinner("Evaluating Context..."):
             F_obs = np.array(problem.evaluate(X))
             st.session_state.F_obs = F_obs
+            
+            # Evaluate objectives for x*
+            x_star_np = x_star.cpu().numpy()
+            F_star = np.array(problem.evaluate(x_star_np))
+            st.session_state.F_star = F_star
 
         st.session_state.cf_results = res
         st.success("Search Complete!")
@@ -651,8 +657,21 @@ with col_obj:
                     ))
                 
             # 3. x* Marker
+            if "F_star" in st.session_state and st.session_state.F_star is not None:
+                F_star = st.session_state.F_star
+                # F_star is (1, 4)
+                # x: Epistemic (1), y: Validity (0), z: Aleatoric (3)
+                x_star_obj_x = F_star[:, 1]
+                x_star_obj_y = F_star[:, 0]
+                x_star_obj_z = F_star[:, 3]
+            else:
+                # Fallback
+                x_star_obj_x = [0]
+                x_star_obj_y = [1]
+                x_star_obj_z = [0]
+
             fig_3d.add_trace(go.Scatter3d(
-                x=[0], y=[1], z=[0], 
+                x=x_star_obj_x, y=x_star_obj_y, z=x_star_obj_z, 
                 mode='markers',
                 marker=dict(size=size_xstar * SIZE_3D_SCALE, color='red', symbol='cross'),
                 name='x* (Reference)'
