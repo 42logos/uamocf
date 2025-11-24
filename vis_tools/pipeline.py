@@ -51,6 +51,7 @@ class ExperimentConfig:
 class ExperimentArtifacts:
     X: Array
     y: Array
+    p_true: Array
     base: TrainResult
     ensemble: List[TrainResult]
     problem: object
@@ -90,7 +91,7 @@ def run_nsga(problem, cfg: NSGACfg):
 
 def run_experiment(cfg: ExperimentConfig) -> ExperimentArtifacts:
     # 1) sample data
-    X, y, _ = sample_dataset(cfg.data)
+    X, y, p_true = sample_dataset(cfg.data)
 
     # 2) train base model
     base_result = _train_base_model(X, y, cfg.train)
@@ -127,6 +128,7 @@ def run_experiment(cfg: ExperimentConfig) -> ExperimentArtifacts:
     return ExperimentArtifacts(
         X=X,
         y=y,
+        p_true=p_true,
         base=base_result,
         ensemble=ensemble_results,
         problem=problem,

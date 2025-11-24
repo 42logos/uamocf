@@ -14,7 +14,9 @@ from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
 from pymoo.termination import get_termination
 
-from vis_tools import data, models, training, uncertainty, cf_problem, plotting
+from vis_tools import data, models, training, uncertainty, cf_problem, plotting, state
+
+PANEL_HEIGHT = 500
 
 st.set_page_config(page_title="OptiView Pro", layout="wide")
 
@@ -40,7 +42,43 @@ if st.sidebar.button("Clear All Selections", type="primary"):
     st.session_state.last_design_select = None
     st.session_state.last_obj_select = None
 
-# 2. System Configuration
+# 2. State Management
+with st.sidebar.expander("State Management", expanded=False):
+    st.subheader("Export")
+    if st.session_state.data is not None:
+        state_bytes = state.export_state(
+            st.session_state.data,
+            st.session_state.models,
+            st.session_state.cf_results,
+            st.session_state.F_obs
+        )
+        st.download_button(
+            label="Download State",
+            data=state_bytes,
+            file_name="optiview_state.pkl",
+            mime="application/octet-stream"
+        )
+    else:
+        st.info("No data to export.")
+
+    st.subheader("Import")
+    uploaded_file = st.file_uploader("Load State", type=["pkl"])
+    if uploaded_file is not None:
+        if st.button("Load State"):
+            try:
+                # Determine device
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                d, m, cf, f_obs = state.import_state(uploaded_file, device=device)
+                st.session_state.data = d
+                st.session_state.models = m
+                st.session_state.cf_results = cf
+                st.session_state.F_obs = f_obs
+                st.success("State loaded successfully!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error loading state: {e}")
+
+# 3. System Configuration
 with st.sidebar.expander("System Configuration", expanded=False):
     st.subheader("Data Generation")
     n_samples = st.slider("Number of Samples", 100, 2000, 500)
@@ -408,7 +446,8 @@ with col_design:
             models=st.session_state.models,
             n_contours=n_contours,
             X_indices=X_indices,
-            pareto_indices=pareto_indices
+            pareto_indices=pareto_indices,
+            height=PANEL_HEIGHT
         )
         
         # Add Highlights
@@ -461,7 +500,7 @@ with col_design:
                     # Simulate linking line by drawing a line to a fixed point or just text
                     pass
 
-        st.plotly_chart(fig1, on_select="rerun", selection_mode=sel_mode_2d, key="design_select", config={'displayModeBar': True})
+        st.plotly_chart(fig1, on_select="rerun", selection_mode=sel_mode_2d, key="design_select", config={'displayModeBar': True}, use_container_width=True)
     else:
         st.info("Initialize System to view Design Space.")
 
@@ -590,7 +629,7 @@ with col_obj:
                     zaxis_title='Aleatoric Unc.'
                 ),
                 margin=dict(l=0, r=0, b=0, t=0),
-                height=500,
+                height=PANEL_HEIGHT,
                 autosize=True,
                 dragmode='orbit', # Ensure rotation is default
                 legend=dict(
@@ -603,7 +642,7 @@ with col_obj:
             # 3D plots don't support box/lasso selection well, so we restrict to points to ensure rotation works
             # We only enable box/lasso if explicitly in Select mode AND if we wanted to support it (which is hard in 3D)
             # For now, we keep 3D as points-only to preserve rotation capabilities.
-            st.plotly_chart(fig_3d, on_select="rerun", selection_mode=["points"], key="obj_select", config={'displayModeBar': True})
+            st.plotly_chart(fig_3d, on_select="rerun", selection_mode=["points"], key="obj_select", config={'displayModeBar': True}, use_container_width=True)
         else:
             st.warning("No solutions found.")
     else:
@@ -614,6 +653,9 @@ col_par, col_det = st.columns([1, 1])
 
 with col_par:
     st.subheader("Parallel Coordinates Plot")
+    
+    # Placeholder for chart to ensure top alignment with Details panel
+    chart_placeholder = st.empty()
     
     # Switcher for Data Source
     par_coords_source = st.radio("Data Source", ["Pareto Front", "Observed Data", "All"], index=0, horizontal=True)
@@ -674,15 +716,15 @@ with col_par:
                     color_continuous_scale=px.colors.diverging.Tealrose,
                     color_continuous_midpoint=0.5
                 )
-                fig_par.update_layout(margin=dict(l=40, r=40, b=20, t=40), height=500)
-                st.plotly_chart(fig_par, use_container_width=True)
+                fig_par.update_layout(margin=dict(l=40, r=40, b=20, t=40), height=PANEL_HEIGHT)
+                chart_placeholder.plotly_chart(fig_par, use_container_width=True)
             else:
-                st.info("No points selected for the chosen source.")
+                chart_placeholder.info("No points selected for the chosen source.")
         else:
-             st.warning("No data available for the chosen source.")
+             chart_placeholder.warning("No data available for the chosen source.")
 
     else:
-        st.info("Run Search to view Parallel Coordinates.")
+        chart_placeholder.info("Run Search to view Parallel Coordinates.")
 
 with col_det:
     st.subheader("Details & Inspector")
@@ -749,7 +791,7 @@ with col_det:
             
             st.dataframe(
                 df_details[cols].style.format("{:.4f}", subset=[c for c in cols if c not in ["Type", "Index"]]), 
-                height=500
+                height=PANEL_HEIGHT
             )
         else:
             st.warning("Selected indices out of range.")

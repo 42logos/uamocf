@@ -12,6 +12,7 @@ from .data import (
 from .models import EnsembleModel, SimpleNN
 from .plotting import plot_proba
 from .training import TrainConfig, train_model, train_ensemble
+from .state import export_state, import_state
 
 # Optional: pipeline components require pymoo; guard import to keep base modules usable.
 try:

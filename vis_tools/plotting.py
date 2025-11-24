@@ -260,7 +260,8 @@ def get_design_space_fig(
     models: Optional[Sequence[nn.Module]] = None,
     n_contours: int = 20,
     X_indices: Optional[Array] = None,
-    pareto_indices: Optional[Array] = None
+    pareto_indices: Optional[Array] = None,
+    height: int = 500
 ) -> go.Figure:
     """
     Generates a Plotly figure for the Design Space (Input Space).
@@ -451,7 +452,7 @@ def get_design_space_fig(
         xaxis_title="x1",
         yaxis_title="x2",
         margin=dict(l=0, r=0, b=0, t=30),
-        height=500,
+        height=height,
         dragmode=dragmode,
         legend=dict(
             orientation="h",
