@@ -486,7 +486,7 @@ with col_design:
                 # Filter out indices that are hidden by mask
                 if mask_obs is not None:
                     # mask_obs is boolean array corresponding to 0..N-1
-                    visible_obs_indices = [i for i in obs_indices if mask_obs[i]]
+                    visible_obs_indices = [i for i in obs_indices if i < len(mask_obs) and mask_obs[i]]
                     obs_indices = visible_obs_indices
                 
                 if obs_indices:
@@ -501,9 +501,12 @@ with col_design:
                     if par_indices:
                         # Filter out indices that are hidden by mask
                         if mask_par is not None:
-                            visible_par_indices = [i for i in par_indices if mask_par[i]]
+                            visible_par_indices = [i for i in par_indices if i < len(mask_par) and mask_par[i]]
                             par_indices = visible_par_indices
                         
+                        # Also filter out indices that are out of bounds of X_cf (if mask_par was None)
+                        par_indices = [i for i in par_indices if i < len(X_cf)]
+
                         if par_indices:
                             high_X.extend(X_cf[par_indices, 0])
                             high_Y.extend(X_cf[par_indices, 1])
@@ -528,7 +531,11 @@ with col_design:
             obs_indices = [i for i in table_indices if i < N]
             if obs_indices:
                 if mask_obs is not None:
-                    obs_indices = [i for i in obs_indices if mask_obs[i]]
+                    obs_indices = [i for i in obs_indices if i < len(mask_obs) and mask_obs[i]]
+                
+                # Bounds check for X
+                obs_indices = [i for i in obs_indices if i < len(X)]
+                
                 if obs_indices:
                     tbl_X.extend(X[obs_indices, 0])
                     tbl_Y.extend(X[obs_indices, 1])
@@ -540,7 +547,11 @@ with col_design:
                     par_indices = [i - N for i in table_indices if i >= N]
                     if par_indices:
                         if mask_par is not None:
-                            par_indices = [i for i in par_indices if mask_par[i]]
+                            par_indices = [i for i in par_indices if i < len(mask_par) and mask_par[i]]
+                        
+                        # Bounds check for X_cf
+                        par_indices = [i for i in par_indices if i < len(X_cf)]
+                        
                         if par_indices:
                             tbl_X.extend(X_cf[par_indices, 0])
                             tbl_Y.extend(X_cf[par_indices, 1])
@@ -656,16 +667,22 @@ with col_obj:
                 if st.session_state.F_obs is not None:
                     obs_idxs = [i for i in highlight_indices if i < N]
                     if obs_idxs:
-                        high_x.extend(st.session_state.F_obs[obs_idxs, 1])
-                        high_y.extend(st.session_state.F_obs[obs_idxs, 0])
-                        high_z.extend(st.session_state.F_obs[obs_idxs, 3])
+                        # Bounds check
+                        obs_idxs = [i for i in obs_idxs if i < len(st.session_state.F_obs)]
+                        if obs_idxs:
+                            high_x.extend(st.session_state.F_obs[obs_idxs, 1])
+                            high_y.extend(st.session_state.F_obs[obs_idxs, 0])
+                            high_z.extend(st.session_state.F_obs[obs_idxs, 3])
                 
                 # Check Pareto
                 par_idxs = [i - N for i in highlight_indices if i >= N]
                 if par_idxs:
-                    high_x.extend(F[par_idxs, 1])
-                    high_y.extend(F[par_idxs, 0])
-                    high_z.extend(F[par_idxs, 3])
+                    # Bounds check
+                    par_idxs = [i for i in par_idxs if i < len(F)]
+                    if par_idxs:
+                        high_x.extend(F[par_idxs, 1])
+                        high_y.extend(F[par_idxs, 0])
+                        high_z.extend(F[par_idxs, 3])
                 
                 if high_x:
                     fig_3d.add_trace(go.Scatter3d(
@@ -685,16 +702,22 @@ with col_obj:
                 if st.session_state.F_obs is not None:
                     obs_idxs = [i for i in table_indices if i < N]
                     if obs_idxs:
-                        tbl_x.extend(st.session_state.F_obs[obs_idxs, 1])
-                        tbl_y.extend(st.session_state.F_obs[obs_idxs, 0])
-                        tbl_z.extend(st.session_state.F_obs[obs_idxs, 3])
+                        # Bounds check
+                        obs_idxs = [i for i in obs_idxs if i < len(st.session_state.F_obs)]
+                        if obs_idxs:
+                            tbl_x.extend(st.session_state.F_obs[obs_idxs, 1])
+                            tbl_y.extend(st.session_state.F_obs[obs_idxs, 0])
+                            tbl_z.extend(st.session_state.F_obs[obs_idxs, 3])
                 
                 # Check Pareto
                 par_idxs = [i - N for i in table_indices if i >= N]
                 if par_idxs:
-                    tbl_x.extend(F[par_idxs, 1])
-                    tbl_y.extend(F[par_idxs, 0])
-                    tbl_z.extend(F[par_idxs, 3])
+                    # Bounds check
+                    par_idxs = [i for i in par_idxs if i < len(F)]
+                    if par_idxs:
+                        tbl_x.extend(F[par_idxs, 1])
+                        tbl_y.extend(F[par_idxs, 0])
+                        tbl_z.extend(F[par_idxs, 3])
                 
                 if tbl_x:
                     fig_3d.add_trace(go.Scatter3d(
@@ -827,10 +850,11 @@ with col_det:
              X_obs = st.session_state.data[0]
              F_obs = st.session_state.F_obs
              for idx in obs_indices:
-                 row = {"Type": "Observed", "Index": idx, "x1": X_obs[idx, 0], "x2": X_obs[idx, 1]}
-                 if F_obs is not None:
-                     row.update({"Validity": F_obs[idx, 0], "Epistemic": F_obs[idx, 1], "Sparsity": F_obs[idx, 2], "Aleatoric": F_obs[idx, 3]})
-                 rows.append(row)
+                 if idx < len(X_obs):
+                     row = {"Type": "Observed", "Index": idx, "x1": X_obs[idx, 0], "x2": X_obs[idx, 1]}
+                     if F_obs is not None and idx < len(F_obs):
+                         row.update({"Validity": F_obs[idx, 0], "Epistemic": F_obs[idx, 1], "Sparsity": F_obs[idx, 2], "Aleatoric": F_obs[idx, 3]})
+                     rows.append(row)
 
         # 2. Pareto Points
         if st.session_state.cf_results is not None:
