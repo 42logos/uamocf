@@ -32,6 +32,13 @@ if "F_obs" not in st.session_state:
 
 # --- Sidebar Controls ---
 
+# 0. Compute Configuration
+st.sidebar.header("Compute")
+available_devices = ["cpu"]
+if torch.cuda.is_available():
+    available_devices.append("cuda")
+selected_device = st.sidebar.selectbox("Device", available_devices, index=0)
+
 # 1. Interaction (Top Priority)
 st.sidebar.header("Interaction")
 interaction_mode = st.sidebar.radio("Mode", ["Explore (Pan/Zoom/Orbit)", "Select (Lasso/Box)"], index=0)
@@ -66,7 +73,7 @@ with st.sidebar.expander("State Management", expanded=False):
         if st.button("Load State"):
             try:
                 # Determine device
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                device = torch.device(selected_device)
                 d, m, cf, f_obs = state.import_state(uploaded_file, device=device)
                 st.session_state.data = d
                 st.session_state.models = m
@@ -107,13 +114,13 @@ with st.sidebar.expander("Visualization Settings", expanded=False):
     n_contours = st.slider("Background Contour Levels", 5, 100, 20)
     
     st.subheader("Opacity")
-    context_opacity = st.slider("Context Opacity", 0.01, 0.5, 0.1)
-    pareto_opacity = st.slider("Pareto Opacity (3D)", 0.1, 1.0, 0.3)
+    context_opacity = st.slider("Context Opacity", 0.01, 1.0, 0.2)
+    pareto_opacity = st.slider("Pareto Opacity (3D)", 0.1, 1.0, 1.0)
 
     st.subheader("Point Sizes")
-    size_pareto = st.slider("Pareto Points", 1, 20, 10)
-    size_context = st.slider("Context Points", 1, 20,10)    
-    size_xstar = st.slider("Reference (x*)", 5, 30, 14)
+    size_pareto = st.slider("Pareto Points", 1, 20, 5)
+    size_context = st.slider("Context Points", 1, 20, 3)    
+    size_xstar = st.slider("Reference (x*)", 5, 30, 6)
     size_sampled = st.slider("Sampled Points", 1, 20, 7)    
 
 # 4. Range & Filters
@@ -292,7 +299,7 @@ if st.sidebar.button("Initialize System (Gen Data + Train)"):
     # 2. Train Model
     train_cfg = training.TrainConfig(
         epochs=n_epochs,
-        device="cpu",
+        device=selected_device,
         progress=True
     )
     
@@ -338,8 +345,13 @@ if st.sidebar.button("Run Counterfactual Search"):
     if st.session_state.models is None or st.session_state.data is None:
         st.error("Please Initialize System first.")
     else:
+        # Ensure models are on the selected device
+        device_obj = torch.device(selected_device)
+        for m in st.session_state.models:
+            m.to(device_obj)
+
         X, Y, _ = st.session_state.data
-        x_star = torch.tensor([[x_star_x, x_star_y]], dtype=torch.float32)
+        x_star = torch.tensor([[x_star_x, x_star_y]], dtype=torch.float32).to(device_obj)
         
         ensemble_model = models.EnsembleModel(st.session_state.models)
         with torch.no_grad():
@@ -360,7 +372,7 @@ if st.sidebar.button("Run Counterfactual Search"):
             config=cf_cfg,
             ensemble=st.session_state.models,
             bayesian_model=ensemble_model,
-            device=torch.device("cpu")
+            device=torch.device(selected_device)
         )
         
         algorithm = NSGA2(pop_size=pop_size)
@@ -603,35 +615,18 @@ with col_obj:
             
             # Filtered indices
             filtered_pareto_indices = all_pareto_indices[mask_par]
+
+            # Split into Valid and Invalid based on Validity (Index 0) <= 0.5
+            valid_mask = F_filtered[:, 0] <= 0.5
+            invalid_mask = ~valid_mask
+
+            F_valid = F_filtered[valid_mask]
+            idx_valid = filtered_pareto_indices[valid_mask]
+
+            F_invalid = F_filtered[invalid_mask]
+            idx_invalid = filtered_pareto_indices[invalid_mask]
             
-            # 1. Pareto Front (Filtered)
-            # Scale sizes for 3D (approx 0.3x of 2D size)
-            SIZE_3D_SCALE = 0.3
-            
-            fig_3d.add_trace(go.Scatter3d(
-                x=F_filtered[:, 1], y=F_filtered[:, 0], z=F_filtered[:, 3],
-                mode='markers',
-                marker=dict(
-                    size=size_pareto * SIZE_3D_SCALE, 
-                    color=F_filtered[:, 2], # Color by Sparsity
-                    colorscale='Viridis', 
-                    showscale=True,
-                    opacity=pareto_opacity,
-                    colorbar=dict(
-                        title="Sparsity",
-                        thickness=15,
-                        len=0.5,
-                        x=1.1,
-                        y=0.5
-                    )
-                ),
-                text=[f"Sparsity: {s:.2f}" for s in F_filtered[:, 2]],
-                customdata=filtered_pareto_indices,
-                hovertemplate='Pareto Idx: %{customdata}<br>Val: %{y:.2f}<br>Epi: %{x:.2f}<br>Ale: %{z:.2f}',
-                name='Pareto Front'
-            ))
-            
-            # 2. Context Cloud (All Possible Points)
+            # 1. Original observations (Context)
             if show_context and st.session_state.F_obs is not None:
                 F_obs = st.session_state.F_obs
                 obs_indices = np.arange(len(F_obs))
@@ -644,26 +639,56 @@ with col_obj:
                 
                 if len(F_obs) > 0:
                     fig_3d.add_trace(go.Scatter3d(
-                        x=F_obs[:, 1], y=F_obs[:, 0], z=F_obs[:, 3],
+                        x=F_obs[:, 1], y=F_obs[:, 0], z=-F_obs[:, 3],
                         mode='markers',
                         marker=dict(
-                            size=size_context * SIZE_3D_SCALE, 
-                            color='gray', 
+                            size=3, 
+                            color='green', 
                             opacity=context_opacity
                         ),
                         customdata=obs_indices,
-                        hovertemplate='Obs Idx: %{customdata}',
-                        name='Context (All Points)'
+                        hovertemplate='Obs Idx: %{customdata}<br>Val: %{y:.2f}<br>Epi: %{x:.2f}<br>Ale: %{z:.2f}',
+                        name='Original observations in Obj Space'
                     ))
-                
-            # 3. x* Marker
+
+            # 2. Pareto Front which not valid
+            if len(F_invalid) > 0:
+                fig_3d.add_trace(go.Scatter3d(
+                    x=F_invalid[:, 1], y=F_invalid[:, 0], z=-F_invalid[:, 3],
+                    mode='markers',
+                    marker=dict(
+                        size=size_pareto, 
+                        color='blue', 
+                        symbol='cross',
+                        opacity=pareto_opacity
+                    ),
+                    customdata=idx_invalid,
+                    hovertemplate='Pareto Idx: %{customdata}<br>Val: %{y:.2f}<br>Epi: %{x:.2f}<br>Ale: %{z:.2f}',
+                    name='Pareto Front which not valid'
+                ))
+
+            # 3. Valid Counterfactuals in Obj Space
+            if len(F_valid) > 0:
+                fig_3d.add_trace(go.Scatter3d(
+                    x=F_valid[:, 1], y=F_valid[:, 0], z=-F_valid[:, 3],
+                    mode='markers',
+                    marker=dict(
+                        size=size_pareto, 
+                        color='red', 
+                        symbol='cross',
+                        opacity=pareto_opacity
+                    ),
+                    customdata=idx_valid,
+                    hovertemplate='Pareto Idx: %{customdata}<br>Val: %{y:.2f}<br>Epi: %{x:.2f}<br>Ale: %{z:.2f}',
+                    name='Valid Counterfactuals in Obj Space'
+                ))
+            
+            # 4. Factual Instance x* in Obj Space
             if "F_star" in st.session_state and st.session_state.F_star is not None:
                 F_star = st.session_state.F_star
-                # F_star is (1, 4)
-                # x: Epistemic (1), y: Validity (0), z: Aleatoric (3)
                 x_star_obj_x = F_star[:, 1]
                 x_star_obj_y = F_star[:, 0]
-                x_star_obj_z = F_star[:, 3]
+                x_star_obj_z = -F_star[:, 3]
             else:
                 # Fallback
                 x_star_obj_x = [0]
@@ -673,8 +698,8 @@ with col_obj:
             fig_3d.add_trace(go.Scatter3d(
                 x=x_star_obj_x, y=x_star_obj_y, z=x_star_obj_z, 
                 mode='markers',
-                marker=dict(size=size_xstar * SIZE_3D_SCALE, color='red', symbol='cross'),
-                name='x* (Reference)'
+                marker=dict(size=size_xstar, color='purple'),
+                name='Factual Instance x* in Obj Space'
             ))
             
             # 4. Highlights (Global Selection)
@@ -690,7 +715,7 @@ with col_obj:
                         if obs_idxs:
                             high_x.extend(st.session_state.F_obs[obs_idxs, 1])
                             high_y.extend(st.session_state.F_obs[obs_idxs, 0])
-                            high_z.extend(st.session_state.F_obs[obs_idxs, 3])
+                            high_z.extend(-st.session_state.F_obs[obs_idxs, 3])
                 
                 # Check Pareto
                 par_idxs = [i - N for i in highlight_indices if i >= N]
@@ -700,7 +725,7 @@ with col_obj:
                     if par_idxs:
                         high_x.extend(F[par_idxs, 1])
                         high_y.extend(F[par_idxs, 0])
-                        high_z.extend(F[par_idxs, 3])
+                        high_z.extend(-F[par_idxs, 3])
                 
                 if high_x:
                     fig_3d.add_trace(go.Scatter3d(
@@ -725,7 +750,7 @@ with col_obj:
                         if obs_idxs:
                             tbl_x.extend(st.session_state.F_obs[obs_idxs, 1])
                             tbl_y.extend(st.session_state.F_obs[obs_idxs, 0])
-                            tbl_z.extend(st.session_state.F_obs[obs_idxs, 3])
+                            tbl_z.extend(-st.session_state.F_obs[obs_idxs, 3])
                 
                 # Check Pareto
                 par_idxs = [i - N for i in table_indices if i >= N]
@@ -735,7 +760,7 @@ with col_obj:
                     if par_idxs:
                         tbl_x.extend(F[par_idxs, 1])
                         tbl_y.extend(F[par_idxs, 0])
-                        tbl_z.extend(F[par_idxs, 3])
+                        tbl_z.extend(-F[par_idxs, 3])
                 
                 if tbl_x:
                     fig_3d.add_trace(go.Scatter3d(
@@ -748,14 +773,15 @@ with col_obj:
 
             fig_3d.update_layout(
                 scene=dict(
-                    xaxis_title='Epistemic Unc.',
-                    yaxis_title='Validity (Prob)',
-                    zaxis_title='Aleatoric Unc.'
+                    xaxis_title='similarity/epistemic uncertainty',
+                    yaxis_title='prob-based validity',
+                    zaxis_title='plausibility/aleotoric uncertainty',
+                    zaxis=dict(autorange='reversed')
                 ),
                 margin=dict(l=0, r=0, b=0, t=0),
                 height=PANEL_HEIGHT,
                 autosize=True,
-                dragmode='orbit', # Ensure rotation is default
+                dragmode='turntable', # Ensure rotation is default
                 legend=dict(
                     yanchor="top",
                     y=0.99,

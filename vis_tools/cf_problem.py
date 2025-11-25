@@ -93,16 +93,20 @@ def make_cf_problem(
             return float(per_sample.mean())
         return float((per_sample * w_np).sum())
 
-    def o5_aleatoric_uncertainty(x: Array) -> float:
+    def aleatoric_uncertainty(x: Array) -> float:
         if ensemble is None or len(ensemble) == 0:
             raise ValueError("Ensemble models must be provided for aleatoric uncertainty.")
         return aleatoric_from_models(ensemble, x, device)
+    
+    # since our goal is maximizing the Aleatoric uncertainty, we define the objective as its negative
+    def o5_aleatoric_uncertainty(x: Array) -> float:
+        return -aleatoric_uncertainty(x)
 
     def o6_epistemic_uncertainty(x: Array) -> float:
         if ensemble is None:
             raise ValueError("Ensemble must be provided for epistemic uncertainty.")
         total = total_uncertainty_ensemble(ensemble, x, device)
-        alea = o5_aleatoric_uncertainty(x)
+        alea = aleatoric_uncertainty(x)
         return total - alea
 
     return FunctionalProblem(
