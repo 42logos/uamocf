@@ -47,6 +47,19 @@ if st.sidebar.button("Clear All Selections", type="primary"):
     st.session_state.global_indices = set()
     st.session_state.last_design_select = None
     st.session_state.last_obj_select = None
+    st.session_state.table_selection = set()
+    st.rerun()
+
+# Manual Index Selection (workaround for 3D - hover to see index, then type it here)
+st.sidebar.caption("💡 **3D Selection**: Hover over a 3D point to see its index, then enter it below")
+col_idx, col_btn = st.sidebar.columns([2, 1])
+with col_idx:
+    manual_index = st.number_input("Point Index", min_value=0, value=0, step=1, key="manual_idx_input", label_visibility="collapsed")
+with col_btn:
+    if st.button("Add", key="add_manual_idx"):
+        st.session_state.global_indices.add(int(manual_index))
+        st.session_state.table_selection = st.session_state.global_indices.copy()
+        st.rerun()
 
 # 2. State Management
 with st.sidebar.expander("State Management", expanded=False):
@@ -238,8 +251,8 @@ if "global_indices" not in st.session_state:
     st.session_state.global_indices = set()
 if "last_design_select" not in st.session_state:
     st.session_state.last_design_select = None
-if "last_obj_select" not in st.session_state:
-    st.session_state.last_obj_select = None
+if "table_selection" not in st.session_state:
+    st.session_state.table_selection = set()
 
 
 
@@ -259,20 +272,8 @@ if curr_design_sel != st.session_state.last_design_select:
             st.session_state.global_indices = set(new_indices)
     st.session_state.last_design_select = curr_design_sel
 
-# Update from Objective Space
-curr_obj_sel = st.session_state.get("obj_select")
-if curr_obj_sel != st.session_state.last_obj_select:
-    new_indices = get_indices_from_selection(curr_obj_sel)
-    # Objective space is always point-based (Explore-like) in this setup
-    # But if we are in Select mode, maybe we should replace?
-    # Let's follow the mode:
-    if interaction_mode.startswith("Explore"):
-        if new_indices:
-            st.session_state.global_indices.update(new_indices)
-    else:
-        if new_indices:
-            st.session_state.global_indices = set(new_indices)
-    st.session_state.last_obj_select = curr_obj_sel
+# Note: 3D objective space selection is not supported by Streamlit.
+# Users can hover over 3D points to see their index, then use the sidebar input to select them.
 
 # --- Main Layout ---
 st.title("uamocf: Uncertainty-Aware Multi-Objective Counterfactuals")
@@ -789,10 +790,10 @@ with col_obj:
                     x=0.01
                 )
             )
-            # 3D plots don't support box/lasso selection well, so we restrict to points to ensure rotation works
-            # We only enable box/lasso if explicitly in Select mode AND if we wanted to support it (which is hard in 3D)
-            # For now, we keep 3D as points-only to preserve rotation capabilities.
-            st.plotly_chart(fig_3d, on_select="rerun", selection_mode=["points"], key="obj_select", config={'displayModeBar': True}, use_container_width=True)
+            # Note: 3D plots don't support selection callbacks in Streamlit.
+            # Use the "Point Index" input in the sidebar to select points by hovering to see their index.
+            st.plotly_chart(fig_3d, config={'displayModeBar': True}, use_container_width=True)
+            st.caption("💡 Hover over points to see their index, then use sidebar 'Point Index' input to select them")
         else:
             st.warning("No solutions found.")
     else:
