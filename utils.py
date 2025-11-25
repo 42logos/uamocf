@@ -94,7 +94,8 @@ def plot_proba(
     ax=None,
     device=None,
     already_prob=False,
-    multiclass_cmap="tab10",
+    multiclass_cmap="auto",     # "auto" | str (cmap name) | list of colors
+    class_colors=None,          # NEW: explicit list of colors for each class
 
     # ---- NEW: coordinate + grid display ----
     show_grid=True,             # 是否显示网格线
@@ -115,8 +116,30 @@ def plot_proba(
     n_classes = len(est.classes_)
 
     # --- Build exact background class palette ---
-    base_cmap = plt.cm.get_cmap(multiclass_cmap, n_classes)
-    multiclass_colors = base_cmap(np.arange(n_classes))  # (n_classes,4 RGBA)
+    if class_colors is not None:
+        # User provided explicit colors
+        multiclass_colors = list(class_colors)
+    elif multiclass_cmap == "auto":
+        # Use a better default palette: blue, orange/yellow, red, ...
+        # This ensures class 0=blue, class 1=orange, class 2=red for 3-class
+        default_colors = [
+            '#1f77b4',  # class 0: blue
+            '#ff7f0e',  # class 1: orange
+            '#d62728',  # class 2: red
+            '#2ca02c',  # class 3: green
+            '#9467bd',  # class 4: purple
+            '#8c564b',  # class 5: brown
+            '#e377c2',  # class 6: pink
+            '#7f7f7f',  # class 7: gray
+            '#bcbd22',  # class 8: olive
+            '#17becf',  # class 9: cyan
+        ]
+        multiclass_colors = default_colors[:n_classes]
+    elif isinstance(multiclass_cmap, list):
+        multiclass_colors = list(multiclass_cmap)
+    else:
+        base_cmap = plt.cm.get_cmap(multiclass_cmap, n_classes)
+        multiclass_colors = [base_cmap(i) for i in range(n_classes)]
 
     if scatter_kwargs is None:
         scatter_kwargs = dict(

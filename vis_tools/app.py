@@ -112,8 +112,8 @@ with st.sidebar.expander("System Configuration", expanded=False):
     c1, c2 = st.columns(2)
     x_star_x = c1.number_input("x* (x1)", value=-0.8)
     x_star_y = c2.number_input("x* (x2)", value=-0.7)
-    pop_size = st.slider("Population Size", 20, 200, 50)
-    n_gen = st.slider("Generations", 50, 500, 200)
+    pop_size = st.slider("Population Size", 20, 1000, 50)
+    n_gen = st.slider("Generations", 50, 1000, 200)
 
 # 3. Visualization Settings
 with st.sidebar.expander("Visualization Settings", expanded=False):
