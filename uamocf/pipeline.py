@@ -47,9 +47,9 @@ from .optimization import (
 )
 
 
-# =============================================================================
+ 
 # Experiment Configurations
-# =============================================================================
+ 
 
 @dataclass
 class Experiment2DConfig:
@@ -136,9 +136,9 @@ class ExperimentMNISTConfig:
         }
 
 
-# =============================================================================
+ 
 # Experiment Results
-# =============================================================================
+ 
 
 @dataclass
 class ExperimentResult:
@@ -204,9 +204,9 @@ class ExperimentResult:
         return self.counterfactuals[is_efficient], self.objectives[is_efficient]
 
 
-# =============================================================================
+ 
 # Pipeline Functions
-# =============================================================================
+ 
 
 def set_random_seed(seed: int) -> None:
     """Set random seed for reproducibility."""
@@ -477,9 +477,9 @@ def run_mnist_experiment(
     )
 
 
-# =============================================================================
+ 
 # Utility Functions
-# =============================================================================
+ 
 
 def save_experiment_result(
     result: ExperimentResult,

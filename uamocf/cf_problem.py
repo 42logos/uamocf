@@ -32,9 +32,8 @@ from .uncertainty import (
 Array = np.ndarray
 
 
-# =============================================================================
 # Configuration
-# =============================================================================
+
 
 @dataclass
 class CFConfig:
@@ -64,9 +63,9 @@ class ImageCFConfig(CFConfig):
     k_neighbors: int = 5
 
 
-# =============================================================================
+
 # Utility Functions
-# =============================================================================
+
 
 def _gower_distance(x: Array, y: Array, feature_range: Array) -> Array:
     """
@@ -102,9 +101,9 @@ def _k_nearest(x: Array, X_obs: Array, k: int) -> Tuple[Array, Array]:
     return X_obs[nearest_idx], dists[nearest_idx]
 
 
-# =============================================================================
+
 # Feature Space Counterfactual Problem (2D Synthetic)
-# =============================================================================
+
 
 def make_cf_problem(
     model: nn.Module,
@@ -167,8 +166,7 @@ def make_cf_problem(
     target_labels = y_target.view(-1).long().tolist()
     p = x_star_np.shape[0]
     
-    # =========== OBJECTIVE FUNCTIONS ===========
-    
+    # OBJECTIVE FUNCTIONS 
     def o1_validity(x: Array) -> float:
         """Validity: 1 - P(target) or hard constraint."""
         x_t = torch.from_numpy(x.astype(np.float32)).unsqueeze(0).to(device)
@@ -242,9 +240,8 @@ def make_cf_problem(
     )
 
 
-# =============================================================================
 # Image Space Counterfactual Problem (MNIST)
-# =============================================================================
+
 
 def make_cf_problem_image_space(
     model: nn.Module,
@@ -406,9 +403,7 @@ def make_cf_problem_image_space(
     )
 
 
-# =============================================================================
 # Factory Functions
-# =============================================================================
 
 def create_2d_cf_problem(
     model: nn.Module,

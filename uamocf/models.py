@@ -16,9 +16,9 @@ from torch import nn
 from sklearn.base import BaseEstimator, ClassifierMixin
 
 
-# =============================================================================
+ 
 # Device Configuration
-# =============================================================================
+ 
 
 @dataclass
 class DeviceConfig:
@@ -46,9 +46,9 @@ def to_device(
     return [m.to(device) for m in models]
 
 
-# =============================================================================
+ 
 # MLP Building Blocks
-# =============================================================================
+ 
 
 def _mlp_layers(
     input_dim: int,
@@ -83,9 +83,9 @@ def _mlp_layers(
     return nn.Sequential(*layers)
 
 
-# =============================================================================
+ 
 # Simple Neural Network for 2D Synthetic Data
-# =============================================================================
+ 
 
 class SimpleNN(nn.Module):
     """
@@ -114,9 +114,9 @@ class SimpleNN(nn.Module):
         return self.net(x)
 
 
-# =============================================================================
+ 
 # CNN for MNIST Classification
-# =============================================================================
+ 
 
 class MNISTClassifier(nn.Module):
     """
@@ -159,9 +159,9 @@ class MNISTClassifier(nn.Module):
         return self.conv(x)
 
 
-# =============================================================================
+ 
 # Ensemble Model
-# =============================================================================
+ 
 
 class EnsembleModel(nn.Module):
     """
@@ -218,9 +218,9 @@ class EnsembleModel(nn.Module):
         return self.models[idx]
 
 
-# =============================================================================
+ 
 # sklearn-compatible Probability Estimator
-# =============================================================================
+ 
 
 class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
     """
@@ -328,9 +328,9 @@ class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
         return self.classes_[np.argmax(proba, axis=1)]
 
 
-# =============================================================================
+ 
 # Model Factory Functions
-# =============================================================================
+ 
 
 def create_simple_nn(
     n_classes: int = 2,

@@ -22,9 +22,9 @@ from torch import nn
 Array = np.ndarray
 
 
-# =============================================================================
+ 
 # Core Entropy Functions
-# =============================================================================
+ 
 
 def entropy(probs: Array) -> Array:
     """
@@ -59,9 +59,9 @@ def softmax_logits(logits: torch.Tensor) -> Array:
     return torch.softmax(logits, dim=-1).cpu().numpy()
 
 
-# =============================================================================
+ 
 # Uncertainty from Model Ensemble
-# =============================================================================
+ 
 
 def _get_probs_from_model(
     model: nn.Module,
@@ -232,9 +232,9 @@ def epistemic_from_models(
     return tu - au
 
 
-# =============================================================================
+ 
 # Comprehensive Uncertainty Decomposition
-# =============================================================================
+ 
 
 @dataclass
 class UncertaintyResult:
@@ -314,9 +314,9 @@ def compute_uncertainty_decomposition(
     )
 
 
-# =============================================================================
+ 
 # Batch Uncertainty Computation (for optimization objectives)
-# =============================================================================
+ 
 
 def batch_aleatoric(
     models: Sequence[nn.Module],

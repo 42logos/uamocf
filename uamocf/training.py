@@ -21,9 +21,9 @@ from .models import SimpleNN, MNISTClassifier
 Array = np.ndarray
 
 
-# =============================================================================
+ 
 # Training Configuration
-# =============================================================================
+ 
 
 @dataclass
 class TrainConfig:
@@ -56,9 +56,9 @@ class MNISTTrainConfig(TrainConfig):
     img_size: int = 16
 
 
-# =============================================================================
+ 
 # Training Results
-# =============================================================================
+ 
 
 @dataclass
 class TrainResult:
@@ -73,9 +73,9 @@ class TrainResult:
     y_train: Optional[Array] = None
 
 
-# =============================================================================
+ 
 # Utility Functions
-# =============================================================================
+ 
 
 def _seed_everything(seed: Optional[int]) -> None:
     """Set seeds for reproducibility."""
@@ -176,9 +176,9 @@ def make_image_loaders(
     return train_loader, val_loader
 
 
-# =============================================================================
+ 
 # Training Functions
-# =============================================================================
+ 
 
 def train_model(
     model: nn.Module,
@@ -360,9 +360,9 @@ def train_image_model(
     )
 
 
-# =============================================================================
+ 
 # Ensemble Training
-# =============================================================================
+ 
 
 def train_ensemble(
     num_models: int,
@@ -495,9 +495,9 @@ def train_mnist_ensemble(
     return results
 
 
-# =============================================================================
+ 
 # Utility: Extract Models from Results
-# =============================================================================
+ 
 
 def extract_models(results: List[TrainResult]) -> List[nn.Module]:
     """Extract trained models from a list of TrainResults."""

@@ -19,9 +19,9 @@ from torch.utils.data import Dataset
 Array = np.ndarray
 
 
-# =============================================================================
+ 
 # Probability Surfaces (P(Y|X) for synthetic data)
-# =============================================================================
+ 
 
 def boundary_focus_prob_multiclass(
     X: Array,
@@ -184,9 +184,9 @@ def make_aleatoric_uncertainty(
     return wrapped_fn
 
 
-# =============================================================================
+ 
 # Data Configurations
-# =============================================================================
+ 
 
 @dataclass
 class DataConfig:
@@ -248,9 +248,9 @@ class MNISTConfig:
         return self.img_size * self.img_size
 
 
-# =============================================================================
+ 
 # Data Generating Process
-# =============================================================================
+ 
 
 def dpg(
     n: int,
@@ -327,9 +327,9 @@ def sample_dataset(cfg: DataConfig) -> Tuple[Array, Array, Array]:
     return dpg(cfg.n, sampler, p_fn, d=cfg.d, rng=rng)
 
 
-# =============================================================================
+ 
 # MNIST Data Utilities
-# =============================================================================
+ 
 
 class MNISTProbabilityFunction:
     """

@@ -25,9 +25,9 @@ from pymoo.termination import get_termination
 Array = np.ndarray
 
 
-# =============================================================================
+ 
 # Configuration
-# =============================================================================
+ 
 
 @dataclass
 class NSGAConfig:
@@ -71,9 +71,9 @@ class ImageNSGAConfig(NSGAConfig):
     max_gen: int = 600
 
 
-# =============================================================================
+ 
 # Custom Sampling Operators
-# =============================================================================
+ 
 
 class FactualBasedSampling(FloatRandomSampling):
     """
@@ -172,9 +172,9 @@ class MixedSampling(FloatRandomSampling):
         return np.clip(X, problem.xl, problem.xu)
 
 
-# =============================================================================
+ 
 # Custom Callbacks
-# =============================================================================
+ 
 
 @dataclass
 class ProgressEntry:
@@ -273,9 +273,9 @@ class ValidCFCallback(Callback):
         }
 
 
-# =============================================================================
+ 
 # Custom Termination Criteria
-# =============================================================================
+ 
 
 class ValidCounterfactualTermination(Termination):
     """
@@ -372,9 +372,9 @@ class ConvergenceTermination(Termination):
         return 0.0
 
 
-# =============================================================================
+ 
 # Optimization Functions
-# =============================================================================
+ 
 
 def run_nsga2(
     problem: Problem,
@@ -484,9 +484,9 @@ def run_image_nsga2(
     return result, callback
 
 
-# =============================================================================
+ 
 # Result Processing Utilities
-# =============================================================================
+ 
 
 @dataclass
 class CFResult:

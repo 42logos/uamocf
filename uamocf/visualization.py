@@ -37,9 +37,9 @@ from .uncertainty import (
 Array = np.ndarray
 
 
-# =============================================================================
+ 
 # Decision Boundary Grid Helper
-# =============================================================================
+ 
 
 def get_decision_boundary_grid(
     model: nn.Module,
@@ -107,9 +107,9 @@ def get_decision_boundary_grid(
     return xx, yy, ZZ
 
 
-# =============================================================================
+ 
 # Color Schemes
-# =============================================================================
+ 
 
 DEFAULT_CLASS_COLORS = [
     '#1f77b4',  # blue
@@ -134,9 +134,9 @@ def get_class_colors(n_classes: int) -> List[str]:
     return [cmap(i) for i in range(n_classes)]
 
 
-# =============================================================================
+ 
 # Probability Surface Plotting
-# =============================================================================
+ 
 
 def plot_proba(
     model: nn.Module,
@@ -364,9 +364,9 @@ def plot_proba(
     return fig, ax
 
 
-# =============================================================================
+ 
 # Uncertainty Heatmap Plotting
-# =============================================================================
+ 
 
 def plot_uncertainty_heatmap(
     models: Sequence[nn.Module],
@@ -526,9 +526,9 @@ def plot_uncertainty_comparison(
     return fig, axes
 
 
-# =============================================================================
+ 
 # Pareto Front Visualization
-# =============================================================================
+ 
 
 def plot_pareto_front_2d(
     F: Array,
@@ -687,9 +687,9 @@ def plot_pareto_front_3d(
     return fig
 
 
-# =============================================================================
+ 
 # Image Counterfactual Visualization
-# =============================================================================
+ 
 
 def visualize_image_counterfactuals(
     model: nn.Module,
