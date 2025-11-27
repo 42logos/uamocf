@@ -3,28 +3,78 @@ NSGA-II optimization utilities for counterfactual generation.
 
 Provides custom sampling, callbacks, and termination criteria for
 multi-objective counterfactual optimization.
+
+Implements MOC (Multi-Objective Counterfactuals) framework adjustments:
+1. ICE Curve Variance Initialization - biases initial population towards influential features
+2. Conditional Mutator with Transformation Trees - ensures plausible mutations
+3. Modified Crowding Distance - diversity in both objective and feature space
+4. Penalization - constraint handling for validity
+
+All components support direct tensor computation to avoid unnecessary numpy conversions.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import numpy as np
-from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.algorithms.moo.nsga2 import NSGA2, RankAndCrowdingSurvival
 from pymoo.core.callback import Callback
 from pymoo.core.problem import Problem
 from pymoo.core.result import Result
 from pymoo.core.termination import Termination
+from pymoo.core.survival import Survival
+from pymoo.core.mutation import Mutation
+from pymoo.core.population import Population
 from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.pm import PM
 from pymoo.operators.sampling.rnd import FloatRandomSampling
 from pymoo.optimize import minimize
 from pymoo.termination import get_termination
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+from sklearn.tree import DecisionTreeRegressor
 import torch
 
 
 Array = Union[np.ndarray, torch.Tensor]
+
+
+# =============================================================================
+# Tensor/Numpy Utility Functions
+# =============================================================================
+
+def to_tensor(x: Array, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Convert array to tensor, avoiding copy if already a tensor on correct device."""
+    if isinstance(x, torch.Tensor):
+        if device is not None and x.device != device:
+            return x.to(device)
+        return x
+    # numpy array
+    t = torch.from_numpy(np.asarray(x).astype(np.float32))
+    if device is not None:
+        t = t.to(device)
+    return t
+
+
+def to_numpy(x: Array) -> np.ndarray:
+    """Convert array to numpy, avoiding copy if already numpy."""
+    if isinstance(x, np.ndarray):
+        return x
+    # torch tensor
+    return x.detach().cpu().numpy()
+
+
+def is_tensor(x: Array) -> bool:
+    """Check if x is a torch tensor."""
+    return isinstance(x, torch.Tensor)
+
+
+def get_device(x: Array) -> Optional[torch.device]:
+    """Get device of tensor, or None for numpy."""
+    if isinstance(x, torch.Tensor):
+        return x.device
+    return None
 
 
 @dataclass
@@ -50,6 +100,24 @@ class NSGAConfig:
     validity_threshold: float = 0.5  # F[0] < threshold means valid
     min_gen: int = 50
     max_gen: int = 500
+    
+    # MOC Framework Adjustments
+    use_ice_initialization: bool = True      # ICE curve variance initialization
+    use_conditional_mutator: bool = True     # Conditional mutator with transformation trees
+    use_modified_crowding: bool = True       # Modified crowding distance (feature + objective)
+    use_penalization: bool = True            # Constraint handling via penalization
+    
+    # ICE initialization parameters
+    ice_p_min: float = 0.01                  # Min probability of changing a feature
+    ice_p_max: float = 0.99                  # Max probability of changing a feature
+    ice_n_samples: int = 50                  # Number of samples for ICE curve estimation
+    
+    # Penalization parameters
+    validity_epsilon: float = 0.5            # Threshold for constraint violation
+    
+    # Crowding distance weighting
+    cd_objective_weight: float = 0.5         # Weight for objective space crowding
+    cd_feature_weight: float = 0.5           # Weight for feature space crowding
 
 class FactualBasedSampling(FloatRandomSampling):
     """
@@ -87,6 +155,899 @@ class FactualBasedSampling(FloatRandomSampling):
         X = np.clip(X, problem.xl, problem.xu)
         
         return X
+
+
+# =============================================================================
+# MOC Adjustment 1: ICE Curve Variance Initialization
+# =============================================================================
+
+def compute_ice_curves(
+    model: Callable,
+    x_star: Array,
+    X_obs: Array,
+    n_samples: int = 50,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Compute Individual Conditional Expectation (ICE) curve variance for each feature.
+    
+    The ICE curve shows how the model's prediction changes when varying a single
+    feature while keeping all others fixed at x_star's values.
+    
+    Supports both tensor and numpy inputs. Computation is done on GPU if device is CUDA.
+    
+    Args:
+        model: Callable that takes (N, d) input and returns predictions
+        x_star: Factual instance, shape (d,) - tensor or numpy
+        X_obs: Observed data for sampling feature values, shape (N, d) - tensor or numpy
+        n_samples: Number of samples per feature for ICE curve
+        device: PyTorch device
+        
+    Returns:
+        sigma_ice: Standard deviation of ICE curve for each feature, shape (d,) as tensor
+    """
+    # Determine device
+    if device is None:
+        if is_tensor(x_star):
+            device = x_star.device
+        elif is_tensor(X_obs):
+            device = X_obs.device
+        elif hasattr(model, 'parameters'):
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device('cpu')
+        else:
+            device = torch.device('cpu')
+    
+    # Convert to tensors on device
+    x_star_t = to_tensor(x_star, device).flatten()
+    X_obs_t = to_tensor(X_obs, device)
+    if X_obs_t.dim() > 2:
+        X_obs_t = X_obs_t.reshape(X_obs_t.shape[0], -1)
+    
+    n_features = x_star_t.shape[0]
+    sigma_ice = torch.zeros(n_features, device=device)
+    
+    for j in range(n_features):
+        # Sample values for feature j from observed data
+        feature_min = X_obs_t[:, j].min()
+        feature_max = X_obs_t[:, j].max()
+        feature_values = torch.linspace(feature_min, feature_max, n_samples, device=device)
+        
+        # Create modified instances: vary feature j, keep others at x_star
+        X_ice = x_star_t.unsqueeze(0).repeat(n_samples, 1)  # (n_samples, d)
+        X_ice[:, j] = feature_values
+        
+        # Get model predictions
+        with torch.no_grad():
+            if hasattr(model, 'forward'):
+                preds = model(X_ice)
+                if preds.dim() > 1:
+                    # Get probability of positive class or last class
+                    preds = torch.softmax(preds, dim=-1)[:, -1]
+            else:
+                # Callable that may not be a PyTorch model
+                preds = model(X_ice)
+                if not isinstance(preds, torch.Tensor):
+                    preds = torch.tensor(preds, device=device, dtype=torch.float32)
+        
+        # Compute standard deviation of ICE curve
+        sigma_ice[j] = preds.std()
+    
+    return sigma_ice
+
+
+def ice_to_probability(
+    sigma_ice: Array,
+    p_min: float = 0.01,
+    p_max: float = 0.99,
+) -> torch.Tensor:
+    """
+    Transform ICE curve standard deviations to probabilities of changing features.
+    
+    Higher variance → higher probability of initialization different from x_star.
+    
+    Formula: P(value differs) = p_min + (σ_j - min(σ)) * (p_max - p_min) / (max(σ) - min(σ))
+    
+    Supports both tensor and numpy inputs.
+    
+    Args:
+        sigma_ice: Standard deviation of ICE curves, shape (d,) - tensor or numpy
+        p_min: Minimum probability of changing a feature
+        p_max: Maximum probability of changing a feature
+        
+    Returns:
+        p_change: Probability of changing each feature, shape (d,) as tensor
+    """
+    # Convert to tensor if needed
+    if not is_tensor(sigma_ice):
+        sigma_ice = torch.tensor(sigma_ice, dtype=torch.float32)
+    
+    sigma_min = sigma_ice.min()
+    sigma_max = sigma_ice.max()
+    
+    if sigma_max - sigma_min < 1e-10:
+        # All features have same importance, use uniform probability
+        return torch.full_like(sigma_ice, (p_min + p_max) / 2)
+    
+    p_change = p_min + (sigma_ice - sigma_min) * (p_max - p_min) / (sigma_max - sigma_min)
+    return torch.clamp(p_change, p_min, p_max)
+
+
+class ICEVarianceSampling(FloatRandomSampling):
+    """
+    MOC ICE Curve Variance Initialization.
+    
+    Biases initial population towards changing features that have high
+    influence on the model's prediction (measured by ICE curve variance).
+    
+    Features with higher ICE variance are more likely to be initialized
+    with values different from x_star.
+    
+    Supports tensor inputs for GPU-accelerated computation.
+    """
+    
+    def __init__(
+        self,
+        x_star: Array,
+        X_obs: Array,
+        model: Callable,
+        p_min: float = 0.01,
+        p_max: float = 0.99,
+        n_samples: int = 50,
+        device: Optional[torch.device] = None,
+    ):
+        """
+        Args:
+            x_star: Factual instance (tensor or numpy)
+            X_obs: Observed data for sampling (tensor or numpy)
+            model: Model for computing ICE curves
+            p_min: Minimum probability of changing a feature
+            p_max: Maximum probability of changing a feature
+            n_samples: Number of samples for ICE curve estimation
+            device: PyTorch device
+        """
+        super().__init__()
+        
+        # Determine device
+        if device is None:
+            if is_tensor(x_star):
+                device = x_star.device
+            elif is_tensor(X_obs):
+                device = X_obs.device
+            else:
+                device = torch.device('cpu')
+        
+        self.device = device
+        
+        # Store as tensors
+        self.x_star = to_tensor(x_star, device).flatten()
+        self.X_obs = to_tensor(X_obs, device)
+        if self.X_obs.dim() > 2:
+            self.X_obs = self.X_obs.reshape(self.X_obs.shape[0], -1)
+        
+        self.model = model
+        self.p_min = p_min
+        self.p_max = p_max
+        self.n_samples = n_samples
+        
+        # Precompute ICE curve variances and change probabilities (on GPU if available)
+        self.sigma_ice = compute_ice_curves(
+            model, self.x_star, self.X_obs, n_samples, device
+        )
+        self.p_change = ice_to_probability(self.sigma_ice, p_min, p_max)
+    
+    def _do(self, problem, n_samples, **kwargs) -> np.ndarray:
+        """Generate samples using ICE variance-based initialization."""
+        n_features = self.x_star.shape[0]
+        
+        # Generate on device for speed
+        X = torch.zeros((n_samples, n_features), device=self.device)
+        
+        # Random values for comparison
+        rand_vals = torch.rand((n_samples, n_features), device=self.device)
+        
+        # For each feature, decide whether to change or keep original
+        for j in range(n_features):
+            change_mask = rand_vals[:, j] < self.p_change[j]
+            # Sample from observed data for changed features
+            n_change = change_mask.sum().item()
+            if n_change > 0:
+                indices = torch.randint(0, self.X_obs.shape[0], (n_change,), device=self.device)
+                X[change_mask, j] = self.X_obs[indices, j]
+            # Keep original for unchanged features
+            X[~change_mask, j] = self.x_star[j]
+        
+        # Clip to problem bounds and convert to numpy for pymoo
+        xl = torch.tensor(problem.xl, device=self.device, dtype=torch.float32)
+        xu = torch.tensor(problem.xu, device=self.device, dtype=torch.float32)
+        X = torch.clamp(X, xl, xu)
+        
+        return X.cpu().numpy()
+
+
+# =============================================================================
+# MOC Adjustment 2: Conditional Mutator with Transformation Trees
+# =============================================================================
+
+class TransformationTreeMutator:
+    """
+    Transformation Trees for conditional value generation.
+    
+    Trains a decision tree for each feature to learn the conditional
+    distribution P(feature_j | other_features) from observed data.
+    
+    Supports both tensor and numpy inputs (converts to numpy internally
+    since sklearn decision trees require numpy).
+    """
+    
+    def __init__(
+        self,
+        X_obs: Array,
+        max_depth: int = 10,
+        min_samples_leaf: int = 5,
+    ):
+        """
+        Train transformation trees on observed data.
+        
+        Args:
+            X_obs: Observed data, shape (N, d) - can be tensor or numpy
+            max_depth: Maximum tree depth
+            min_samples_leaf: Minimum samples per leaf
+        """
+        # Convert to numpy (sklearn requires numpy)
+        X_obs_np = to_numpy(X_obs)
+        self.X_obs = X_obs_np.reshape(X_obs_np.shape[0], -1)
+        self.n_features = self.X_obs.shape[1]
+        self.trees: List[DecisionTreeRegressor] = []
+        
+        # Train a tree for each feature
+        for j in range(self.n_features):
+            # Features: all other features
+            X_train = np.delete(self.X_obs, j, axis=1)
+            # Target: feature j
+            y_train = self.X_obs[:, j]
+            
+            tree = DecisionTreeRegressor(
+                max_depth=max_depth,
+                min_samples_leaf=min_samples_leaf,
+                random_state=42,
+            )
+            tree.fit(X_train, y_train)
+            self.trees.append(tree)
+        
+        # Store leaf assignments for efficient sampling
+        self._leaf_samples = self._compute_leaf_samples()
+    
+    def _compute_leaf_samples(self) -> List[Dict[int, np.ndarray]]:
+        """Precompute which training samples fall into each leaf."""
+        leaf_samples = []
+        
+        for j, tree in enumerate(self.trees):
+            X_train = np.delete(self.X_obs, j, axis=1)
+            leaf_ids = tree.apply(X_train)
+            
+            # Group sample indices by leaf
+            leaf_dict = {}
+            for idx, leaf_id in enumerate(leaf_ids):
+                if leaf_id not in leaf_dict:
+                    leaf_dict[leaf_id] = []
+                leaf_dict[leaf_id].append(self.X_obs[idx, j])
+            
+            # Convert to arrays
+            leaf_dict = {k: np.array(v) for k, v in leaf_dict.items()}
+            leaf_samples.append(leaf_dict)
+        
+        return leaf_samples
+    
+    def sample_conditional(
+        self,
+        x: np.ndarray,
+        feature_idx: int,
+    ) -> float:
+        """
+        Sample a plausible value for feature_idx conditioned on other features.
+        
+        Args:
+            x: Current individual, shape (d,) - can be tensor or numpy
+            feature_idx: Index of feature to sample
+            
+        Returns:
+            Sampled value for the feature
+        """
+        # Convert to numpy (sklearn requires numpy)
+        x_np = to_numpy(x)
+        
+        # Get tree for this feature
+        tree = self.trees[feature_idx]
+        
+        # Prepare input (all features except feature_idx)
+        x_other = np.delete(x_np, feature_idx).reshape(1, -1)
+        
+        # Find which leaf this instance falls into
+        leaf_id = tree.apply(x_other)[0]
+        
+        # Sample from training points in same leaf
+        leaf_values = self._leaf_samples[feature_idx].get(leaf_id)
+        
+        if leaf_values is not None and len(leaf_values) > 0:
+            return float(np.random.choice(leaf_values))
+        else:
+            # Fallback: use tree prediction (mean of leaf)
+            return float(tree.predict(x_other)[0])
+
+
+class ConditionalMutation(Mutation):
+    """
+    MOC Conditional Mutator.
+    
+    Uses transformation trees to generate plausible feature values
+    conditioned on other features, ensuring mutations stay on-manifold.
+    
+    Key implementation details:
+    1. Mutations are applied in randomized order (important for dependencies)
+    2. Each mutation conditions on the current state of other features
+    3. Falls back to standard polynomial mutation if tree sampling fails
+    """
+    
+    def __init__(
+        self,
+        transformation_trees: TransformationTreeMutator,
+        prob: float = None,
+        eta: float = 20,
+        use_conditional_prob: float = 0.7,
+    ):
+        """
+        Args:
+            transformation_trees: Trained TransformationTreeMutator
+            prob: Mutation probability per variable
+            eta: Distribution index for fallback polynomial mutation
+            use_conditional_prob: Probability of using conditional vs standard mutation
+        """
+        super().__init__()
+        self.trees = transformation_trees
+        self.prob = prob
+        self.eta = eta
+        self.use_conditional_prob = use_conditional_prob
+        
+        # Standard polynomial mutator as fallback
+        self._pm = PM(prob=prob, eta=eta)
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        """
+        Apply conditional mutation to population.
+        
+        Args:
+            problem: pymoo Problem
+            X: Population decision variables, shape (n_pop, n_var)
+            
+        Returns:
+            Mutated population, shape (n_pop, n_var)
+        """
+        n_pop, n_var = X.shape
+        X_mutated = X.copy()
+        
+        # Per-variable mutation probability
+        prob = self.prob if self.prob is not None else (1.0 / n_var)
+        
+        for i in range(n_pop):
+            # Randomize feature order for mutation (critical for conditional logic)
+            feature_order = np.random.permutation(n_var)
+            
+            for j in feature_order:
+                if np.random.random() < prob:
+                    if np.random.random() < self.use_conditional_prob:
+                        # Use conditional mutation via transformation tree
+                        new_value = self.trees.sample_conditional(X_mutated[i], j)
+                        X_mutated[i, j] = new_value
+                    else:
+                        # Use standard polynomial mutation for this gene
+                        delta = (problem.xu[j] - problem.xl[j]) * 0.1
+                        X_mutated[i, j] += np.random.uniform(-delta, delta)
+        
+        # Clip to bounds
+        X_mutated = np.clip(X_mutated, problem.xl, problem.xu)
+        
+        return X_mutated
+
+
+# =============================================================================
+# MOC Adjustment 3: Modified Crowding Distance (Feature + Objective Space)
+# =============================================================================
+
+def gower_distance_tensor(
+    x: torch.Tensor, 
+    y: torch.Tensor, 
+    feature_range: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute Gower distance between two individuals using tensors.
+    
+    Gower distance normalizes each feature by its range.
+    """
+    diff = torch.abs(x - y) / torch.clamp(feature_range, min=1e-10)
+    return torch.mean(torch.clamp(diff, max=1.0))
+
+
+def gower_distance(x: Array, y: Array, feature_range: Array) -> float:
+    """
+    Compute Gower distance between two individuals.
+    
+    Gower distance normalizes each feature by its range.
+    Supports both tensor and numpy inputs.
+    """
+    if is_tensor(x) and is_tensor(y) and is_tensor(feature_range):
+        return gower_distance_tensor(x, y, feature_range).item()
+    
+    # Convert to numpy for computation
+    x_np = to_numpy(x)
+    y_np = to_numpy(y)
+    fr_np = to_numpy(feature_range)
+    
+    diff = np.abs(x_np - y_np) / np.maximum(fr_np, 1e-10)
+    return float(np.mean(np.minimum(diff, 1.0)))
+
+
+def compute_crowding_distance_L1_tensor(F: torch.Tensor) -> torch.Tensor:
+    """
+    Compute crowding distance in objective space using L1 norm (tensor version).
+    
+    For each objective, sort by that objective and assign distance
+    as the difference between neighbors, normalized by range.
+    
+    Args:
+        F: Objective values, shape (n, m) as tensor
+        
+    Returns:
+        Crowding distances, shape (n,) as tensor
+    """
+    n, m = F.shape
+    device = F.device
+    
+    if n <= 2:
+        return torch.full((n,), float('inf'), device=device)
+    
+    cd = torch.zeros(n, device=device)
+    
+    for obj in range(m):
+        # Sort by this objective
+        sorted_idx = torch.argsort(F[:, obj])
+        
+        # Objective range
+        obj_range = F[:, obj].max() - F[:, obj].min()
+        if obj_range < 1e-10:
+            continue
+        
+        # Boundary points get infinite distance
+        cd[sorted_idx[0]] = float('inf')
+        cd[sorted_idx[-1]] = float('inf')
+        
+        # Interior points: distance to neighbors
+        for k in range(1, n - 1):
+            cd[sorted_idx[k]] += (
+                F[sorted_idx[k + 1], obj] - F[sorted_idx[k - 1], obj]
+            ) / obj_range
+    
+    return cd
+
+
+def compute_crowding_distance_L1(F: Array) -> Array:
+    """
+    Compute crowding distance in objective space using L1 norm.
+    
+    Supports both tensor and numpy inputs.
+    
+    Args:
+        F: Objective values, shape (n, m)
+        
+    Returns:
+        Crowding distances, shape (n,)
+    """
+    if is_tensor(F):
+        return compute_crowding_distance_L1_tensor(F)
+    
+    # Numpy version
+    n, m = F.shape
+    
+    if n <= 2:
+        return np.full(n, np.inf)
+    
+    cd = np.zeros(n)
+    
+    for obj in range(m):
+        # Sort by this objective
+        sorted_idx = np.argsort(F[:, obj])
+        
+        # Objective range
+        obj_range = F[:, obj].max() - F[:, obj].min()
+        if obj_range < 1e-10:
+            continue
+        
+        # Boundary points get infinite distance
+        cd[sorted_idx[0]] = np.inf
+        cd[sorted_idx[-1]] = np.inf
+        
+        # Interior points: distance to neighbors
+        for k in range(1, n - 1):
+            cd[sorted_idx[k]] += (
+                F[sorted_idx[k + 1], obj] - F[sorted_idx[k - 1], obj]
+            ) / obj_range
+    
+    return cd
+
+
+def compute_crowding_distance_feature_space_tensor(
+    X: torch.Tensor,
+    feature_range: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute crowding distance in feature space using Gower distance (tensor version).
+    
+    For each individual, sum distances to 2 nearest neighbors.
+    
+    Args:
+        X: Decision variables, shape (n, d) as tensor
+        feature_range: Range of each feature, shape (d,) as tensor
+        
+    Returns:
+        Crowding distances in feature space, shape (n,) as tensor
+    """
+    n = X.shape[0]
+    device = X.device
+    
+    if n <= 2:
+        return torch.full((n,), float('inf'), device=device)
+    
+    cd_feature = torch.zeros(n, device=device)
+    
+    # Compute pairwise Gower distances efficiently
+    # Normalize X by feature range
+    X_norm = X / torch.clamp(feature_range, min=1e-10)
+    
+    for i in range(n):
+        # Compute distance to all others
+        diffs = torch.abs(X_norm[i] - X_norm)  # (n, d)
+        diffs = torch.clamp(diffs, max=1.0)
+        distances = diffs.mean(dim=1)  # (n,)
+        distances[i] = float('inf')  # Exclude self
+        
+        # Get 2 smallest distances
+        sorted_dists, _ = torch.sort(distances)
+        cd_feature[i] = sorted_dists[0] + sorted_dists[1]
+    
+    return cd_feature
+
+
+def compute_crowding_distance_feature_space(
+    X: Array,
+    feature_range: Array,
+) -> Array:
+    """
+    Compute crowding distance in feature space using Gower distance.
+    
+    For each individual, sum distances to 2 nearest neighbors.
+    Supports both tensor and numpy inputs.
+    
+    Args:
+        X: Decision variables, shape (n, d)
+        feature_range: Range of each feature, shape (d,)
+        
+    Returns:
+        Crowding distances in feature space, shape (n,)
+    """
+    if is_tensor(X) and is_tensor(feature_range):
+        return compute_crowding_distance_feature_space_tensor(X, feature_range)
+    
+    # Numpy version
+    X_np = to_numpy(X)
+    fr_np = to_numpy(feature_range)
+    
+    n = X_np.shape[0]
+    
+    if n <= 2:
+        return np.full(n, np.inf)
+    
+    cd_feature = np.zeros(n)
+    
+    for i in range(n):
+        # Compute Gower distance to all other individuals
+        distances = []
+        for j in range(n):
+            if i != j:
+                distances.append(gower_distance(X_np[i], X_np[j], fr_np))
+        
+        distances = np.array(distances)
+        distances.sort()
+        
+        # Sum of distances to 2 nearest neighbors
+        cd_feature[i] = distances[0] + (distances[1] if len(distances) > 1 else 0)
+    
+    return cd_feature
+
+
+def modified_crowding_distance_tensor(
+    F: torch.Tensor,
+    X: torch.Tensor,
+    feature_range: torch.Tensor,
+    weight_obj: float = 0.5,
+    weight_feature: float = 0.5,
+) -> torch.Tensor:
+    """
+    MOC Modified Crowding Distance (tensor version).
+    
+    Combines crowding distance in objective space (L1 norm) and
+    feature space (Gower distance) with equal weighting.
+    """
+    device = F.device
+    
+    cd_obj = compute_crowding_distance_L1_tensor(F)
+    cd_feature = compute_crowding_distance_feature_space_tensor(X, feature_range)
+    
+    # Handle infinite values
+    inf_mask_obj = torch.isinf(cd_obj)
+    inf_mask_feature = torch.isinf(cd_feature)
+    
+    cd_obj_finite = cd_obj.clone()
+    cd_feature_finite = cd_feature.clone()
+    
+    if not inf_mask_obj.all():
+        max_obj = cd_obj[~inf_mask_obj].max() * 2
+        cd_obj_finite[inf_mask_obj] = max_obj
+    
+    if not inf_mask_feature.all():
+        max_feature = cd_feature[~inf_mask_feature].max() * 2
+        cd_feature_finite[inf_mask_feature] = max_feature
+    
+    # Normalize to [0, 1]
+    def normalize_tensor(arr):
+        arr_min, arr_max = arr.min(), arr.max()
+        if arr_max - arr_min < 1e-10:
+            return torch.ones_like(arr)
+        return (arr - arr_min) / (arr_max - arr_min)
+    
+    cd_obj_norm = normalize_tensor(cd_obj_finite)
+    cd_feature_norm = normalize_tensor(cd_feature_finite)
+    
+    # Combined crowding distance
+    cd_combined = weight_obj * cd_obj_norm + weight_feature * cd_feature_norm
+    
+    # Restore infinite values for boundary points
+    cd_combined[inf_mask_obj | inf_mask_feature] = float('inf')
+    
+    return cd_combined
+
+
+def modified_crowding_distance(
+    F: Array,
+    X: Array,
+    feature_range: Array,
+    weight_obj: float = 0.5,
+    weight_feature: float = 0.5,
+) -> Array:
+    """
+    MOC Modified Crowding Distance.
+    
+    Combines crowding distance in objective space (L1 norm) and
+    feature space (Gower distance) with equal weighting.
+    
+    This ensures diversity in both the objective values AND the
+    actual feature changes, providing more diverse actionable advice.
+    
+    Supports both tensor and numpy inputs.
+    
+    Args:
+        F: Objective values, shape (n, m)
+        X: Decision variables, shape (n, d)
+        feature_range: Range of each feature, shape (d,)
+        weight_obj: Weight for objective space crowding
+        weight_feature: Weight for feature space crowding
+        
+    Returns:
+        Combined crowding distances, shape (n,)
+    """
+    if is_tensor(F) and is_tensor(X) and is_tensor(feature_range):
+        return modified_crowding_distance_tensor(F, X, feature_range, weight_obj, weight_feature)
+    
+    # Numpy version
+    F_np = to_numpy(F)
+    X_np = to_numpy(X)
+    fr_np = to_numpy(feature_range)
+    
+    cd_obj = compute_crowding_distance_L1(F_np)
+    cd_feature = compute_crowding_distance_feature_space(X_np, fr_np)
+    
+    # Handle infinite values
+    cd_obj_finite = np.where(np.isinf(cd_obj), np.nanmax(cd_obj[~np.isinf(cd_obj)]) * 2, cd_obj)
+    cd_feature_finite = np.where(np.isinf(cd_feature), np.nanmax(cd_feature[~np.isinf(cd_feature)]) * 2, cd_feature)
+    
+    # Normalize to [0, 1]
+    def normalize(arr):
+        arr_min, arr_max = arr.min(), arr.max()
+        if arr_max - arr_min < 1e-10:
+            return np.ones_like(arr)
+        return (arr - arr_min) / (arr_max - arr_min)
+    
+    cd_obj_norm = normalize(cd_obj_finite)
+    cd_feature_norm = normalize(cd_feature_finite)
+    
+    # Combined crowding distance
+    cd_combined = weight_obj * cd_obj_norm + weight_feature * cd_feature_norm
+    
+    # Restore infinite values for boundary points
+    cd_combined[np.isinf(cd_obj) | np.isinf(cd_feature)] = np.inf
+    
+    return cd_combined
+
+
+# =============================================================================
+# MOC Adjustment 4: Penalization (Constraint Handling)
+# =============================================================================
+
+def penalized_nondominated_sort(
+    F: np.ndarray,
+    constraint_violations: np.ndarray,
+) -> List[np.ndarray]:
+    """
+    MOC Penalization: Nondominated sorting with constraint handling.
+    
+    After standard nondominated sorting, constraint violators are
+    reassigned to later fronts based on their violation magnitude.
+    
+    This ensures that infeasible solutions (CFs too far from target)
+    are less likely to be selected for the next generation.
+    
+    Args:
+        F: Objective values, shape (n, m)
+        constraint_violations: Constraint violation for each individual, shape (n,)
+                              0 = feasible, >0 = magnitude of violation
+                              
+    Returns:
+        List of fronts, each front is array of indices
+    """
+    n = F.shape[0]
+    
+    # Step 1: Standard nondominated sorting
+    nds = NonDominatedSorting()
+    fronts = nds.do(F, return_rank=False)
+    
+    # Convert to lists for modification
+    fronts = [list(f) for f in fronts]
+    n_original_fronts = len(fronts)
+    
+    # Step 2: Identify and remove violators from their fronts
+    violators = []
+    for front_idx, front in enumerate(fronts):
+        to_remove = []
+        for ind_idx in front:
+            if constraint_violations[ind_idx] > 0:
+                violators.append((ind_idx, constraint_violations[ind_idx]))
+                to_remove.append(ind_idx)
+        for idx in to_remove:
+            front.remove(idx)
+    
+    # Step 3: Sort violators by violation magnitude (least violating first)
+    violators.sort(key=lambda x: x[1])
+    
+    # Step 4: Assign violators to penalty fronts
+    for i, (ind_idx, _) in enumerate(violators):
+        penalty_front_idx = n_original_fronts + i
+        while penalty_front_idx >= len(fronts):
+            fronts.append([])
+        fronts[penalty_front_idx].append(ind_idx)
+    
+    # Remove empty fronts
+    fronts = [np.array(f) for f in fronts if len(f) > 0]
+    
+    return fronts
+
+
+class PenalizedRankAndCrowdingSurvival(Survival):
+    """
+    MOC Survival operator with penalization and modified crowding distance.
+    
+    Combines:
+    1. Penalized nondominated sorting (constraint handling)
+    2. Modified crowding distance (feature + objective space diversity)
+    """
+    
+    def __init__(
+        self,
+        validity_epsilon: float = 0.5,
+        weight_obj: float = 0.5,
+        weight_feature: float = 0.5,
+        nds: NonDominatedSorting = None,
+    ):
+        """
+        Args:
+            validity_epsilon: Threshold for validity constraint
+            weight_obj: Weight for objective space crowding distance
+            weight_feature: Weight for feature space crowding distance
+            nds: NonDominatedSorting instance
+        """
+        super().__init__(filter_infeasible=False)
+        self.validity_epsilon = validity_epsilon
+        self.weight_obj = weight_obj
+        self.weight_feature = weight_feature
+        self.nds = nds if nds is not None else NonDominatedSorting()
+        self._feature_range = None
+    
+    def set_feature_range(self, feature_range: np.ndarray):
+        """Set feature range for Gower distance computation."""
+        self._feature_range = feature_range
+    
+    def _do(
+        self,
+        problem: Problem,
+        pop: Population,
+        *args,
+        n_survive: int = None,
+        **kwargs,
+    ) -> Population:
+        """
+        Select survivors using penalized sorting and modified crowding.
+        
+        Args:
+            problem: pymoo Problem
+            pop: Current population
+            n_survive: Number of survivors to select
+            
+        Returns:
+            Surviving population
+        """
+        F = pop.get("F")
+        X = pop.get("X")
+        
+        if n_survive is None:
+            n_survive = len(pop)
+        
+        # Compute constraint violations (validity objective is F[:, 0])
+        # Violation = max(0, F[:, 0] - epsilon)
+        constraint_violations = np.maximum(0, F[:, 0] - self.validity_epsilon)
+        
+        # Penalized nondominated sorting
+        fronts = penalized_nondominated_sort(F, constraint_violations)
+        
+        # Feature range for Gower distance
+        if self._feature_range is None:
+            self._feature_range = problem.xu - problem.xl
+            self._feature_range[self._feature_range == 0] = 1.0
+        
+        # Assign ranks to all individuals based on their front
+        ranks = np.zeros(len(pop), dtype=int)
+        for rank, front in enumerate(fronts):
+            ranks[front] = rank
+        
+        # Compute modified crowding distance for ALL individuals
+        all_cd = modified_crowding_distance(
+            F, X, self._feature_range,
+            self.weight_obj, self.weight_feature
+        )
+        
+        # Set rank and crowding distance on population (required by pymoo's tournament selection)
+        pop.set("rank", ranks)
+        pop.set("crowding", all_cd)
+        
+        # Select survivors front by front
+        survivors = []
+        for front in fronts:
+            if len(survivors) + len(front) <= n_survive:
+                # Entire front fits
+                survivors.extend(front)
+            else:
+                # Need to select subset based on modified crowding distance
+                n_remaining = n_survive - len(survivors)
+                
+                # Get crowding distances for this front
+                cd_front = all_cd[front]
+                
+                # Select individuals with highest crowding distance
+                sorted_by_cd = np.argsort(-cd_front)  # Descending order
+                selected = front[sorted_by_cd[:n_remaining]]
+                survivors.extend(selected)
+                break
+        
+        return pop[survivors]
 
 
 class GaussianFactualSampling(FloatRandomSampling):
@@ -191,6 +1152,14 @@ class ValidCFCallback(Callback):
         if F is None:
             return
         
+        # Ensure F is 2D
+        if F.ndim == 1:
+            F = F.reshape(1, -1)
+        
+        # Handle empty F
+        if F.size == 0 or F.shape[0] == 0:
+            return
+        
         # Count valid CFs in population
         n_valid_pop = int(np.sum(F[:, 0] < self.validity_threshold))
         
@@ -199,10 +1168,15 @@ class ValidCFCallback(Callback):
         mean_sparsity = 0.0
         if algorithm.opt is not None:
             F_opt = algorithm.opt.get("F")
-            if F_opt is not None:
-                n_valid_archive = int(np.sum(F_opt[:, 0] < self.validity_threshold))
-                # Mean sparsity of Pareto front (objective index 1 is sparsity)
-                mean_sparsity = float(F_opt[:, 1].mean()) if F_opt.shape[1] > 1 else 0.0
+            if F_opt is not None and F_opt.size > 0:
+                # Ensure F_opt is 2D
+                if F_opt.ndim == 1:
+                    F_opt = F_opt.reshape(1, -1)
+                # Only process if we have at least one column
+                if F_opt.shape[1] > 0:
+                    n_valid_archive = int(np.sum(F_opt[:, 0] < self.validity_threshold))
+                    # Mean sparsity of Pareto front (objective index 1 is sparsity)
+                    mean_sparsity = float(F_opt[:, 1].mean()) if F_opt.shape[1] > 1 else 0.0
         
         # Best validity
         best_validity = float(F[:, 0].min())
@@ -400,5 +1374,160 @@ def run_nsga(
     
     # Store callback history in the algorithm's callback for later retrieval
     # The callback is accessible via result.algorithm.callback
+    
+    return result
+
+
+def run_moc_nsga(
+    problem: Problem,
+    config: NSGAConfig,
+    x_star: Array,
+    X_obs: Array,
+    model: Callable = None,
+    device: Optional[torch.device] = None,
+) -> Result:
+    """
+    Run NSGA-II with MOC (Multi-Objective Counterfactuals) framework adjustments.
+    
+    Implements all four key MOC modifications:
+    1. ICE Curve Variance Initialization - biases initial population
+    2. Conditional Mutator with Transformation Trees - plausible mutations
+    3. Modified Crowding Distance - diversity in feature + objective space
+    4. Penalization - constraint handling for validity
+    
+    Args:
+        problem: pymoo Problem for counterfactual optimization
+        config: NSGAConfig with MOC parameters
+        x_star: Factual instance, shape (d,) - can be tensor or numpy
+        X_obs: Observed data, shape (N, d) - can be tensor or numpy
+        model: Model for ICE curve computation (required if use_ice_initialization=True)
+        device: PyTorch device
+        
+    Returns:
+        pymoo Result object
+    """
+    # Store original tensor versions if needed for model calls
+    x_star_tensor = to_tensor(x_star, device=device) if device else None
+    X_obs_tensor = to_tensor(X_obs, device=device) if device else None
+    
+    # Convert to numpy for pymoo (optimization operates on numpy)
+    x_star_np = to_numpy(x_star).flatten()
+    X_obs_np = to_numpy(X_obs).reshape(-1, x_star_np.shape[0])
+    
+    # ==========================================================================
+    # MOC Adjustment 1: ICE Curve Variance Initialization
+    # ==========================================================================
+    if config.use_ice_initialization and model is not None:
+        # ICEVarianceSampling handles tensor conversion internally
+        sampling = ICEVarianceSampling(
+            x_star=x_star,  # Pass original (may be tensor)
+            X_obs=X_obs,    # Pass original (may be tensor)
+            model=model,
+            p_min=config.ice_p_min,
+            p_max=config.ice_p_max,
+            n_samples=config.ice_n_samples,
+            device=device,
+        )
+        if config.verbose:
+            print(f"[MOC] ICE Variance Initialization enabled")
+            print(f"      Feature change probabilities: min={sampling.p_change.min():.3f}, "
+                  f"max={sampling.p_change.max():.3f}, mean={sampling.p_change.mean():.3f}")
+    else:
+        # Fallback to factual-based sampling
+        sampling = FactualBasedSampling(x_star=x_star_np, noise_scale=0.2)
+        if config.verbose:
+            print(f"[MOC] Using Factual-Based Sampling (ICE disabled or no model)")
+    
+    # ==========================================================================
+    # MOC Adjustment 2: Conditional Mutator with Transformation Trees
+    # ==========================================================================
+    mutation_prob = config.mutation_prob if config.mutation_prob is not None else (1.0 / problem.n_var)
+    
+    if config.use_conditional_mutator:
+        # Train transformation trees on observed data (handles tensor internally)
+        transformation_trees = TransformationTreeMutator(X_obs)
+        mutation = ConditionalMutation(
+            transformation_trees=transformation_trees,
+            prob=mutation_prob,
+            eta=config.mutation_eta,
+            use_conditional_prob=0.7,  # 70% conditional, 30% standard
+        )
+        if config.verbose:
+            print(f"[MOC] Conditional Mutator enabled (70% conditional, 30% polynomial)")
+    else:
+        mutation = PM(prob=mutation_prob, eta=int(config.mutation_eta))
+        if config.verbose:
+            print(f"[MOC] Using standard Polynomial Mutation")
+    
+    # ==========================================================================
+    # MOC Adjustment 3 & 4: Modified Crowding Distance + Penalization
+    # ==========================================================================
+    if config.use_modified_crowding or config.use_penalization:
+        survival = PenalizedRankAndCrowdingSurvival(
+            validity_epsilon=config.validity_epsilon,
+            weight_obj=config.cd_objective_weight,
+            weight_feature=config.cd_feature_weight,
+        )
+        # Set feature range for Gower distance
+        feature_range = problem.xu - problem.xl
+        feature_range[feature_range == 0] = 1.0
+        survival.set_feature_range(feature_range)
+        
+        if config.verbose:
+            if config.use_modified_crowding:
+                print(f"[MOC] Modified Crowding Distance enabled "
+                      f"(obj={config.cd_objective_weight:.1f}, feature={config.cd_feature_weight:.1f})")
+            if config.use_penalization:
+                print(f"[MOC] Penalization enabled (epsilon={config.validity_epsilon:.2f})")
+    else:
+        survival = RankAndCrowdingSurvival()
+        if config.verbose:
+            print(f"[MOC] Using standard Rank and Crowding Survival")
+    
+    # ==========================================================================
+    # Create NSGA-II Algorithm with MOC Components
+    # ==========================================================================
+    algorithm = NSGA2(
+        pop_size=config.pop_size,
+        sampling=sampling,
+        crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
+        mutation=mutation,
+        survival=survival,
+        eliminate_duplicates=True,
+    )
+    
+    # Setup termination criteria
+    if config.use_valid_cf_termination:
+        termination = ValidCounterfactualTermination(
+            min_valid_cf=config.min_valid_cf,
+            validity_threshold=config.validity_threshold,
+            min_gen=config.min_gen,
+            max_gen=config.max_gen,
+        )
+    else:
+        termination = get_termination("n_gen", config.n_gen)
+    
+    # Setup callback
+    callback = ValidCFCallback(
+        validity_threshold=config.validity_threshold,
+        print_every=10,
+        verbose=config.verbose,
+    )
+    
+    if config.verbose:
+        print(f"\n[MOC] Starting NSGA-II optimization...")
+        print(f"      Population: {config.pop_size}, Max generations: {config.max_gen}")
+        print(f"      Features: {problem.n_var}, Objectives: {problem.n_obj}")
+        print("-" * 60)
+    
+    # Run optimization
+    result = minimize(
+        problem,
+        algorithm,
+        termination,
+        seed=config.seed,
+        callback=callback,
+        verbose=False,
+    )
     
     return result

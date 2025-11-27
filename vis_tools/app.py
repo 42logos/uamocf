@@ -57,7 +57,7 @@ interaction_mode = st.sidebar.radio("Mode", ["Explore (Pan/Zoom/Orbit)", "Select
 
 if st.sidebar.button("Clear All Selections", type="primary"):
     st.session_state.global_indices = set()
-    st.session_state.last_design_select = None
+    st.session_state.last_design_indices = ()
     st.session_state.last_obj_select = None
     st.session_state.table_selection = set()
     st.rerun()
@@ -239,16 +239,44 @@ with st.sidebar.expander("Range & Filters", expanded=True):
 # --- Helper Functions ---
 def get_indices_from_selection(selection):
     if not selection: return []
-    points = selection.get("selection", {}).get("points", [])
+    
+    # Handle Streamlit PlotlyState object which has .selection.points
+    # or dict-like access with selection["selection"]["points"]
+    try:
+        # Try attribute access first (PlotlyState object)
+        if hasattr(selection, 'selection'):
+            sel_obj = selection.selection
+            if hasattr(sel_obj, 'points'):
+                points = sel_obj.points
+            else:
+                points = sel_obj.get("points", []) if sel_obj else []
+        else:
+            # Fallback to dict access
+            points = selection.get("selection", {}).get("points", [])
+    except (AttributeError, TypeError):
+        points = []
+    
+    if not points:
+        return []
+    
     # Flatten customdata if it's a list (sometimes it is)
     indices = []
     for p in points:
-        if "customdata" in p:
+        # Handle both dict-like and object-like point access
+        # AttributeDictionary supports both [] and . access
+        cd = None
+        try:
+            # Try dict-like access first (works for dict and AttributeDictionary)
             cd = p["customdata"]
-            if isinstance(cd, list):
-                indices.extend(cd)
+        except (KeyError, TypeError):
+            # Fallback to attribute access
+            cd = getattr(p, "customdata", None)
+        
+        if cd is not None:
+            if isinstance(cd, (list, tuple)):
+                indices.extend([int(x) for x in cd])
             else:
-                indices.append(cd)
+                indices.append(int(cd))
     return list(set(indices))
 
 def filter_mask(F_data, filters):
@@ -270,28 +298,29 @@ def filter_mask(F_data, filters):
 # --- Global Selection Logic ---
 if "global_indices" not in st.session_state:
     st.session_state.global_indices = set()
-if "last_design_select" not in st.session_state:
-    st.session_state.last_design_select = None
+if "last_design_indices" not in st.session_state:
+    st.session_state.last_design_indices = ()
 if "table_selection" not in st.session_state:
     st.session_state.table_selection = set()
 
-
-
-# Update from Design Space
+# Update from Design Space - Extract indices directly each time
 curr_design_sel = st.session_state.get("design_select")
-if curr_design_sel != st.session_state.last_design_select:
-    new_indices = get_indices_from_selection(curr_design_sel)
+new_indices = get_indices_from_selection(curr_design_sel)
+
+# Convert to a hashable representation for comparison
+curr_indices_tuple = tuple(sorted(new_indices)) if new_indices else ()
+last_indices_tuple = st.session_state.get("last_design_indices", ())
+
+if curr_indices_tuple != last_indices_tuple and curr_indices_tuple:
     if interaction_mode.startswith("Explore"):
         # Additive
-        if new_indices:
-            st.session_state.global_indices.update(new_indices)
+        st.session_state.global_indices.update(new_indices)
     else:
         # Replace (Select Mode)
-        # Only replace if we have a valid selection. 
-        # This prevents clearing selection when the plot re-renders (which might reset selection state).
-        if new_indices:
-            st.session_state.global_indices = set(new_indices)
-    st.session_state.last_design_select = curr_design_sel
+        st.session_state.global_indices = set(new_indices)
+    st.session_state.last_design_indices = curr_indices_tuple
+    # Force rerun to update UI with new selection
+    st.rerun()
 
 # Note: 3D objective space selection is not supported by Streamlit.
 # Users can hover over 3D points to see their index, then use the sidebar input to select them.
@@ -964,22 +993,9 @@ with col_det:
         if rows:
             df_details = pd.DataFrame(rows)
             
-            # Apply Objective Filters to Details
-            # We need to check if the row values satisfy the filters
-            # Columns in df_details are full names: Validity, Epistemic, Sparsity, Aleatoric
-            
-            mask_details = np.ones(len(df_details), dtype=bool)
-            for name, val in obj_filters.items():
-                if name in df_details.columns:
-                    if isinstance(val, list):
-                        # Discrete filtering
-                        mask_details &= df_details[name].isin(val)
-                    else:
-                        # Range filtering
-                        min_v, max_v = val
-                        mask_details &= (df_details[name] >= min_v) & (df_details[name] <= max_v)
-            
-            df_details = df_details[mask_details]
+            # Note: We don't apply objective filters to the Details panel
+            # If a point is selected, it should always be shown regardless of filters
+            # The filters are only used for the visualization panels
 
             # Rename columns for brevity
             rename_map = {

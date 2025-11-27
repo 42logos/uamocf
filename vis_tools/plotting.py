@@ -21,12 +21,36 @@ from core.models import EnsembleModel
 from core.cf_problem import aleatoric_from_models, epistemic_from_models
 
 
-Array = np.ndarray
+Array = Union[np.ndarray, torch.Tensor]
+
+
+def is_tensor(x: Array) -> bool:
+    """Check if input is a PyTorch tensor."""
+    return isinstance(x, torch.Tensor)
+
+
+def to_numpy(x: Array) -> np.ndarray:
+    """Convert tensor or numpy array to numpy."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def to_tensor(x: Array, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Convert numpy array or tensor to tensor on specified device."""
+    if isinstance(x, torch.Tensor):
+        t = x
+    else:
+        t = torch.from_numpy(np.asarray(x).astype(np.float32))
+    if device is not None:
+        t = t.to(device)
+    return t
 
 
 class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
     """
     sklearn-compatible adapter for a trained PyTorch classifier.
+    Supports both tensor and numpy inputs.
     """
 
     _estimator_type = "classifier"
@@ -45,23 +69,34 @@ class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
             self.device = next(torch_model.parameters()).device
 
     def fit(self, X, y=None):
-        X = np.asarray(X)
-        self.n_features_in_ = X.shape[1]
+        X_np = to_numpy(X)
+        self.n_features_in_ = X_np.shape[1]
 
         if y is not None:
-            self.classes_ = np.unique(y)
+            self.classes_ = np.unique(to_numpy(y))
         else:
-            p = self.predict_proba(X[:4])
+            p = self.predict_proba(X_np[:4])
             self.classes_ = np.arange(p.shape[1])
 
         self.is_fitted_ = True
         return self
 
     @torch.no_grad()
-    def predict_proba(self, X):
-        if not isinstance(X, np.ndarray):
-            X = np.asarray(X)
-        X_tensor = torch.from_numpy(X).float().to(self.device)
+    def predict_proba(self, X, return_tensor: bool = False) -> Array:
+        """
+        Predict class probabilities.
+        
+        Args:
+            X: Input data, shape (N, d) - can be tensor or numpy
+            return_tensor: If True, return tensor; if False, return numpy.
+                          If input is tensor and return_tensor not specified,
+                          returns tensor to avoid unnecessary conversion.
+        
+        Returns:
+            Class probabilities, shape (N, n_classes)
+        """
+        input_is_tensor = is_tensor(X)
+        X_tensor = to_tensor(X, device=self.device)
 
         probs_list = []
         for i in range(0, len(X_tensor), self.batch_size):
@@ -80,13 +115,27 @@ class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
                 else:
                     prob = torch.softmax(out, dim=1)
 
-            probs_list.append(prob.cpu())
+            probs_list.append(prob)
 
-        return torch.cat(probs_list, dim=0).numpy()
+        result = torch.cat(probs_list, dim=0)
+        
+        # Decide output format
+        should_return_tensor = return_tensor or input_is_tensor
+        
+        if should_return_tensor:
+            return result
+        else:
+            return result.cpu().numpy()
 
-    def predict(self, X):
-        proba = self.predict_proba(X)
-        return self.classes_[np.argmax(proba, axis=1)]
+    def predict(self, X) -> Array:
+        """Predict class labels."""
+        input_is_tensor = is_tensor(X)
+        proba = self.predict_proba(X, return_tensor=False)
+        result = self.classes_[np.argmax(proba, axis=1)]
+        
+        if input_is_tensor:
+            return torch.from_numpy(result)
+        return result
 
 
 def plot_proba(

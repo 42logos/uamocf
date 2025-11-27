@@ -6,9 +6,38 @@ import numpy as np
 import torch
 from sklearn.base import BaseEstimator, ClassifierMixin
 from core.cf_problem import Total_uncertainty, aleatoric_from_models, epistemic_from_models
+from typing import Union, Optional
+
+Array = Union[np.ndarray, torch.Tensor]
+
+
+def is_tensor(x: Array) -> bool:
+    """Check if input is a PyTorch tensor."""
+    return isinstance(x, torch.Tensor)
+
+
+def to_numpy(x: Array) -> np.ndarray:
+    """Convert tensor or numpy array to numpy."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def to_tensor(x: Array, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Convert numpy array or tensor to tensor on specified device."""
+    if isinstance(x, torch.Tensor):
+        t = x
+    else:
+        t = torch.from_numpy(np.asarray(x).astype(np.float32))
+    if device is not None:
+        t = t.to(device)
+    return t
+
+
 class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
     """
     sklearn-compatible adapter for a trained PyTorch classifier.
+    Supports both tensor and numpy inputs.
     """
 
     _estimator_type = "classifier"  # <-- Force sklearn to treat it as classifier
@@ -31,23 +60,34 @@ class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
         Dummy fit: does NOT train torch_model.
         Only sets fitted attrs for sklearn checks.
         """
-        X = np.asarray(X)
-        self.n_features_in_ = X.shape[1]  # sklearn-friendly
+        X_np = to_numpy(X)
+        self.n_features_in_ = X_np.shape[1]  # sklearn-friendly
 
         if y is not None:
-            self.classes_ = np.unique(y)
+            self.classes_ = np.unique(to_numpy(y))
         else:
-            p = self.predict_proba(X[:4])
+            p = self.predict_proba(X_np[:4])
             self.classes_ = np.arange(p.shape[1])
 
         self.is_fitted_ = True
         return self
 
     @torch.no_grad()
-    def predict_proba(self, X):
-        if not isinstance(X, np.ndarray):
-            X = np.asarray(X)
-        X_tensor = torch.from_numpy(X).float().to(self.device)
+    def predict_proba(self, X, return_tensor: bool = False) -> Array:
+        """
+        Predict class probabilities.
+        
+        Args:
+            X: Input data, shape (N, d) - can be tensor or numpy
+            return_tensor: If True, return tensor; if False, return numpy.
+                          If input is tensor and return_tensor not specified,
+                          returns tensor to avoid unnecessary conversion.
+        
+        Returns:
+            Class probabilities, shape (N, n_classes)
+        """
+        input_is_tensor = is_tensor(X)
+        X_tensor = to_tensor(X, device=self.device)
 
         probs_list = []
         for i in range(0, len(X_tensor), self.batch_size):
@@ -68,13 +108,27 @@ class TorchProbaEstimator(ClassifierMixin, BaseEstimator):
                 else:
                     prob = torch.softmax(out, dim=1)
 
-            probs_list.append(prob.cpu())
+            probs_list.append(prob)
 
-        return torch.cat(probs_list, dim=0).numpy()
+        result = torch.cat(probs_list, dim=0)
+        
+        # Decide output format
+        should_return_tensor = return_tensor or input_is_tensor
+        
+        if should_return_tensor:
+            return result
+        else:
+            return result.cpu().numpy()
 
-    def predict(self, X):
-        proba = self.predict_proba(X)
-        return self.classes_[np.argmax(proba, axis=1)]
+    def predict(self, X) -> Array:
+        """Predict class labels."""
+        input_is_tensor = is_tensor(X)
+        proba = self.predict_proba(X, return_tensor=False)
+        result = self.classes_[np.argmax(proba, axis=1)]
+        
+        if input_is_tensor:
+            return torch.from_numpy(result)
+        return result
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -441,8 +495,14 @@ def plot_cf_3d(
 
     fig = go.Figure()
 
+    # Compute objective values for X
+    # Note: F[:,3] is negated plausibility/AU in the optimization (to maximize it)
+    # We compute positive AU values here for display
+    X_objs = problem.evaluate(X)
+    X_au_positive = np.abs(X_objs[:, 3])  # Use abs to get positive AU values
+    
     fig.add_trace(go.Scatter3d(
-        x=problem.evaluate(X)[:,1], y=problem.evaluate(X)[:,0], z=-problem.evaluate(X)[:,3],
+        x=X_objs[:,1], y=X_objs[:,0], z=X_au_positive,
         mode='markers',
         marker=dict(color='green', size=3, opacity=0.2),
         name='Original observations in Obj Space'
@@ -459,10 +519,11 @@ def plot_cf_3d(
         if context_objs.ndim == 1:
             context_objs = context_objs[None, :]  # Make it 2D if single result
         
+        context_au_positive = np.abs(context_objs[:, 3])
         fig.add_trace(go.Scatter3d(
             x=context_objs[:, 1],
             y=context_objs[:, 0],
-            z=-context_objs[:, 3],
+            z=context_au_positive,
             mode='markers',
             marker=dict(color='green', size=4, opacity=0.2),
             name='Context Points in Obj Space'
@@ -490,18 +551,22 @@ def plot_cf_3d(
         raise ValueError("No valid counterfactuals found.")
     
     valided_F_mmo = np.array(valided_F_mmo)
-    not_valided_F_mmo = np.array(not_valided_F_mmo)
+    
+    # Only add invalid CFs trace if there are any
+    if len(not_valided_F_mmo) > 0:
+        not_valided_F_mmo = np.array(not_valided_F_mmo)
+        not_valided_au_positive = np.abs(not_valided_F_mmo[:, 3])
+        fig.add_trace(go.Scatter3d(
+            x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=not_valided_au_positive,
+            mode='markers',
+            marker=dict(color='blue', size=5, opacity=1, symbol='cross'),
+            name='Pareto Front which not valid'
+        ))
 
+    # Use abs to get positive AU values for display
+    valided_au_positive = np.abs(valided_F_mmo[:, 3])
     fig.add_trace(go.Scatter3d(
-        x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=-not_valided_F_mmo[:,3],
-        mode='markers',
-        marker=dict(color='blue', size=
-                    5, opacity=1,symbol='cross'),
-        name='Pareto Front which not valid'
-    ))
-
-    fig.add_trace(go.Scatter3d(
-        x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=-valided_F_mmo[:,3],
+        x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=valided_au_positive,
         mode='markers',
         marker=dict(color='red', size=5, symbol='cross'),
         name='Valid Counterfactuals in Obj Space'
@@ -517,10 +582,11 @@ def plot_cf_3d(
     elif factual_obj.ndim > 1:
         factual_obj = factual_obj.flatten()
     
+    factual_au_positive = abs(factual_obj[3])
     fig.add_trace(go.Scatter3d(
         x=[factual_obj[1]],
         y=[factual_obj[0]],
-        z=[-factual_obj[3]],
+        z=[factual_au_positive],
         mode='markers',
         marker=dict(color='purple', size=6),
         name='Factual Instance x* in Obj Space'
@@ -530,15 +596,12 @@ def plot_cf_3d(
 
     fig.update_layout(
         scene=dict(
-            xaxis_title='similarity/epistemic uncertainty',
-            yaxis_title='prob-based validity',
-            zaxis_title='plausibility/aleotoric uncertainty'
+            xaxis_title='Similarity',
+            yaxis_title='Validity (1 - P(target))',
+            zaxis_title='Plausibility (Aleatoric Uncertainty)'
         ),
         width=900, height=700
     )
-
-    # reverse z axis
-    fig.update_layout(scene=dict(zaxis=dict(autorange='reversed')))
 
     fig.show()
 

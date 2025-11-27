@@ -14,6 +14,32 @@ from torch import nn
 
 Array = Union[np.ndarray, torch.Tensor]
 
+# =============================================================================
+# Tensor Utility Functions
+# =============================================================================
+
+def is_tensor(x: Array) -> bool:
+    """Check if input is a PyTorch tensor."""
+    return isinstance(x, torch.Tensor)
+
+
+def to_numpy(x: Array) -> np.ndarray:
+    """Convert tensor or numpy array to numpy."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def to_tensor(x: Array, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Convert numpy array or tensor to tensor on specified device."""
+    if isinstance(x, torch.Tensor):
+        t = x
+    else:
+        t = torch.from_numpy(np.asarray(x).astype(np.float32))
+    if device is not None:
+        t = t.to(device)
+    return t
+
 def _gower_distance_tensor(x: torch.Tensor, y: torch.Tensor, feature_range: torch.Tensor) -> torch.Tensor:
     """
     Compute normalized feature-wise dissimilarity (Gower distance) using tensors.
@@ -79,18 +105,33 @@ def _k_nearest(x: Array, X_obs: Array, k: int) -> Tuple[Array, Array]:
     return X_obs[nearest_idx], dists[nearest_idx]
 
 
-def aleatoric_from_models(model_ensemble:EnsembleModel, x: Array) -> Array:
+def aleatoric_from_models(
+    model_ensemble: EnsembleModel, 
+    x: Array,
+    return_tensor: bool = False,
+) -> Array:
     """
     Average aleatoric uncertainty across an ensemble of models.
     Supports both single point (d,) and batch (N, d).
+    
+    Args:
+        model_ensemble: Ensemble of trained models
+        x: Input points, shape (d,) or (N, d) - can be tensor or numpy
+        return_tensor: If True, return tensor; if False, return numpy.
+                       Default False for backward compatibility.
+                       If input is tensor and return_tensor not specified,
+                       returns tensor to avoid unnecessary conversion.
+    
+    Returns:
+        Aleatoric uncertainty, shape (N,) or scalar
     """
-
+    input_is_tensor = is_tensor(x)
+    
     is_batch = x.ndim > 1
     if not is_batch:
-        x = x[None, :] # (1, d)
-        
-    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
-    x_t = x_t.to(model_ensemble.device)
+        x = x[None, :]  # (1, d)
+    
+    x_t = to_tensor(x, device=model_ensemble.device)
     
     # Collect probabilities from all models
     all_probs = []
@@ -99,20 +140,30 @@ def aleatoric_from_models(model_ensemble:EnsembleModel, x: Array) -> Array:
             logits = m(x_t)
             probs = torch.softmax(logits, dim=-1)
             all_probs.append(probs)
-            
+    
     # Stack: (n_models, N, n_classes)
     all_probs = torch.stack(all_probs)
     
     # Aleatoric uncertainty = Mean of Entropies
     # Entropy of each model: -sum(p log p)
-    entropies = -torch.sum(all_probs * torch.log(all_probs + 1e-12), dim=-1) # (n_models, N)
-    mean_entropy = torch.mean(entropies, dim=0).cpu().numpy() # (N,)
+    entropies = -torch.sum(all_probs * torch.log(all_probs + 1e-12), dim=-1)  # (n_models, N)
+    mean_entropy = torch.mean(entropies, dim=0)  # (N,)
     
-    if not is_batch:
-        return mean_entropy
-    return mean_entropy
+    # Decide output format
+    should_return_tensor = return_tensor or input_is_tensor
+    
+    if should_return_tensor:
+        return mean_entropy if is_batch else mean_entropy[0]
+    else:
+        result = mean_entropy.cpu().numpy()
+        return result if is_batch else result[0]
 
-def Total_uncertainty(model_ensemble:EnsembleModel, x: Array, device: Optional[torch.device]=None) -> Union[float, Array]:
+def Total_uncertainty(
+    model_ensemble: EnsembleModel, 
+    x: Array, 
+    device: Optional[torch.device] = None,
+    return_tensor: bool = False,
+) -> Union[float, Array]:
     """
     Total uncertainty = Entropy of the mean predictive distribution.
     
@@ -122,15 +173,27 @@ def Total_uncertainty(model_ensemble:EnsembleModel, x: Array, device: Optional[t
     3. Compute entropy of the averaged distribution
     
     Supports both single point (d,) and batch (N, d).
+    
+    Args:
+        model_ensemble: Ensemble of trained models
+        x: Input points, shape (d,) or (N, d) - can be tensor or numpy
+        device: PyTorch device (defaults to model_ensemble.device)
+        return_tensor: If True, return tensor; if False, return numpy.
+                       If input is tensor and return_tensor not specified,
+                       returns tensor to avoid unnecessary conversion.
+    
+    Returns:
+        Total uncertainty, shape (N,) or scalar
     """
+    input_is_tensor = is_tensor(x)
+    
     is_batch = x.ndim > 1
     if not is_batch:
         x = x[None, :]  # (1, d)
     
     if device is None:
         device = model_ensemble.device
-    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
-    x_t = x_t.to(device)
+    x_t = to_tensor(x, device=device)
     
     # Collect probabilities from all models
     all_probs = []
@@ -147,13 +210,22 @@ def Total_uncertainty(model_ensemble:EnsembleModel, x: Array, device: Optional[t
     mean_probs = torch.mean(all_probs, dim=0)
     
     # Total uncertainty = entropy of mean prediction
-    ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-12), dim=-1).cpu().numpy()  # (N,)
+    ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-12), dim=-1)  # (N,)
     
-    if not is_batch:
-        return float(ent[0])
-    return ent
+    # Decide output format
+    should_return_tensor = return_tensor or input_is_tensor
+    
+    if should_return_tensor:
+        return ent if is_batch else ent[0]
+    else:
+        result = ent.cpu().numpy()
+        return float(result[0]) if not is_batch else result
 
-def epistemic_from_models(model_ensemble:EnsembleModel, x: Array) -> Union[float, Array]:
+def epistemic_from_models(
+    model_ensemble: EnsembleModel, 
+    x: Array,
+    return_tensor: bool = False,
+) -> Union[float, Array]:
     """
     Epistemic uncertainty from an ensemble of models.
     
@@ -167,12 +239,31 @@ def epistemic_from_models(model_ensemble:EnsembleModel, x: Array) -> Union[float
     EU is always >= 0 by Jensen's inequality.
     
     Supports both single point (d,) and batch (N, d).
+    Supports both tensor and numpy inputs.
+    
+    Args:
+        model_ensemble: Ensemble of trained models
+        x: Input points, shape (d,) or (N, d) - can be tensor or numpy
+        return_tensor: If True, return tensor; if False, return numpy.
+                       If input is tensor and return_tensor not specified,
+                       returns tensor to avoid unnecessary conversion.
+    
+    Returns:
+        Epistemic uncertainty, shape (N,) or scalar
     """
-    AU = aleatoric_from_models(model_ensemble, x)
-    TU = Total_uncertainty(model_ensemble, x)
+    input_is_tensor = is_tensor(x)
+    should_return_tensor = return_tensor or input_is_tensor
+    
+    # Compute using tensors internally
+    AU = aleatoric_from_models(model_ensemble, x, return_tensor=True)
+    TU = Total_uncertainty(model_ensemble, x, return_tensor=True)
     EU = TU - AU
+    
     # EU should be non-negative by Jensen's inequality, but clamp for numerical stability
-    return np.maximum(EU, 0.0)
+    if should_return_tensor:
+        return torch.clamp(EU, min=0.0)
+    else:
+        return np.maximum(to_numpy(EU), 0.0)
 
 def make_cf_problem(
     model: nn.Module,
