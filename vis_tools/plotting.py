@@ -17,7 +17,8 @@ from torch import nn
 import plotly.graph_objects as go
 import plotly.express as px
 
-from . import uncertainty
+from core.models import EnsembleModel
+from core.cf_problem import aleatoric_from_models, epistemic_from_models
 
 
 Array = np.ndarray
@@ -316,7 +317,9 @@ def get_design_space_fig(
             # Fallback if no ensemble
             Z = np.zeros_like(xx)
         else:
-            au = uncertainty.aleatoric_from_models(models, grid_points, device)
+            # Convert to EnsembleModel if needed
+            ensemble = models if isinstance(models, EnsembleModel) else EnsembleModel(list(models)).to(device)
+            au = aleatoric_from_models(ensemble, grid_points)
             Z = au.reshape(xx.shape)
         colorscale = 'Viridis'
         zmin, zmax = None, None
@@ -326,7 +329,9 @@ def get_design_space_fig(
         if models is None:
             Z = np.zeros_like(xx)
         else:
-            eu = uncertainty.epistemic_from_models(models, grid_points, device)
+            # Convert to EnsembleModel if needed
+            ensemble = models if isinstance(models, EnsembleModel) else EnsembleModel(list(models)).to(device)
+            eu = epistemic_from_models(ensemble, grid_points)
             Z = eu.reshape(xx.shape)
         colorscale = 'Plasma'
         zmin, zmax = None, None

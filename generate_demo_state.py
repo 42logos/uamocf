@@ -21,10 +21,10 @@ from torch import nn
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from vis_tools import state
-from vis_tools.models import SimpleNN, EnsembleModel
-from vis_tools.data import sample_dataset, DataConfig
-from vis_tools.training import train_model, train_ensemble, TrainConfig
-from vis_tools.cf_problem import make_cf_problem, CFConfig
+from core.models import SimpleNN, EnsembleModel
+from core.data import SamplingConfig, sample_from_config, moon_prob
+from core.training import train_ensemble, TrainConfig
+from core.cf_problem import make_cf_problem
 from core.optimization import NSGAConfig, run_nsga
 
 
@@ -83,8 +83,11 @@ def generate_demo_state(
     if verbose:
         print("\n[1/4] Generating data...")
     
-    data_cfg = DataConfig(n=n_samples, seed=seed)
-    X, y, p_true = sample_dataset(data_cfg)
+    data_cfg = SamplingConfig(n=n_samples, seed=seed, p_fn=moon_prob())
+    X, y, p_true = sample_from_config(data_cfg)
+    X = np.asarray(X)
+    y = np.asarray(y)
+    p_true = np.asarray(p_true)
     
     if verbose:
         print(f"  X shape: {X.shape}")
@@ -101,9 +104,9 @@ def generate_demo_state(
     
     # Train ensemble with resampling for diversity
     def resample_data(idx: int):
-        cfg = DataConfig(n=n_samples, seed=seed + idx)
-        X_i, y_i, _ = sample_dataset(cfg)
-        return X_i, y_i
+        cfg = SamplingConfig(n=n_samples, seed=seed + idx, p_fn=moon_prob())
+        X_i, y_i, _ = sample_from_config(cfg)
+        return np.asarray(X_i), np.asarray(y_i)
     
     ensemble_results = train_ensemble(
         num_models=ensemble_size,
@@ -140,23 +143,18 @@ def generate_demo_state(
         print(f"  x* predicted class: {current_class}")
         print(f"  Target class: {y_target}")
     
-    # Create weights for sparsity objective
-    cf_cfg = CFConfig(k_neighbors=5)
-    weights = torch.ones(cf_cfg.k_neighbors, device=device)
-    
     # Create ensemble model wrapper
     ensemble_model = EnsembleModel(models).to(device)
     
-    # Create the CF problem
+    # Create the CF problem using core.cf_problem directly
     problem = make_cf_problem(
         model=models[0],
-        x_star=x_star_t,
+        x_factual=x_star_t,
         y_target=y_target_t,
         X_obs=X_obs_t,
-        weights=weights,
-        config=cf_cfg,
-        ensemble=models,
-        bayesian_model=ensemble_model,
+        k_neighbors=5,
+        use_soft_validity=True,
+        ensemble=ensemble_model,
         device=device
     )
     

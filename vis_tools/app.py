@@ -14,7 +14,14 @@ from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
 from pymoo.termination import get_termination
 
-from vis_tools import data, models, training, uncertainty, cf_problem, plotting, state
+# Import from core modules directly
+from core.models import SimpleNN, EnsembleModel
+from core.data import SamplingConfig, sample_from_config, moon_prob
+from core.training import train_ensemble, TrainConfig
+from core.cf_problem import make_cf_problem
+
+# Import vis_tools-specific modules (state, plotting)
+from vis_tools import plotting, state
 
 PANEL_HEIGHT = 500
 
@@ -153,42 +160,43 @@ with st.sidebar.expander("Range & Filters", expanded=True):
     st.subheader("Design Space Range")
     use_custom_range = st.checkbox("Custom Range", value=False)
     
-    custom_x_range = None
-    custom_y_range = None
-
-    if use_custom_range:
-        # Default bounds
+    # Calculate default range from data: 1.1 × (max - min) centered on data
+    if st.session_state.data is not None:
+        X_data = st.session_state.data[0]
+        x_d_min, x_d_max = X_data[:, 0].min(), X_data[:, 0].max()
+        y_d_min, y_d_max = X_data[:, 1].min(), X_data[:, 1].max()
+        
+        # 1.1× the data range (5% margin on each side)
+        x_span = x_d_max - x_d_min
+        y_span = y_d_max - y_d_min
+        margin_x = x_span * 0.05
+        margin_y = y_span * 0.05
+        
+        # Default view: 1.1× data range
+        x_val_min = x_d_min - margin_x
+        x_val_max = x_d_max + margin_x
+        y_val_min = y_d_min - margin_y
+        y_val_max = y_d_max + margin_y
+        
+        # Slider bounds (allow zooming out further, 50% margin)
+        outer_margin_x = x_span * 0.5
+        outer_margin_y = y_span * 0.5
+        x_min_def = x_d_min - outer_margin_x
+        x_max_def = x_d_max + outer_margin_x
+        y_min_def = y_d_min - outer_margin_y
+        y_max_def = y_d_max + outer_margin_y
+    else:
+        # Fallback defaults when no data
         x_min_def, x_max_def = -3.0, 3.0
         y_min_def, y_max_def = -3.0, 3.0
-        
-        # Default values (current view)
         x_val_min, x_val_max = -2.5, 2.5
         y_val_min, y_val_max = -2.5, 2.5
-
-        if st.session_state.data is not None:
-            X_data = st.session_state.data[0]
-            x_d_min, x_d_max = X_data[:, 0].min(), X_data[:, 0].max()
-            y_d_min, y_d_max = X_data[:, 1].min(), X_data[:, 1].max()
-            
-            # Margin 10% of the span for default view
-            x_span = x_d_max - x_d_min
-            y_span = y_d_max - y_d_min
-            margin_x = x_span * 0.1
-            margin_y = y_span * 0.1
-            
-            x_val_min = x_d_min - margin_x
-            x_val_max = x_d_max + margin_x
-            y_val_min = y_d_min - margin_y
-            y_val_max = y_d_max + margin_y
-            
-            # Slider bounds (allow more zooming out, say 50% margin)
-            outer_margin_x = x_span * 0.5
-            outer_margin_y = y_span * 0.5
-            x_min_def = x_d_min - outer_margin_x
-            x_max_def = x_d_max + outer_margin_x
-            y_min_def = y_d_min - outer_margin_y
-            y_max_def = y_d_max + outer_margin_y
-
+    
+    # Always set default range to 1.1× data range
+    custom_x_range = (float(x_val_min), float(x_val_max))
+    custom_y_range = (float(y_val_min), float(y_val_max))
+    
+    if use_custom_range:
         custom_x_range = st.slider("X Range", float(x_min_def), float(x_max_def), (float(x_val_min), float(x_val_max)))
         custom_y_range = st.slider("Y Range", float(y_min_def), float(y_max_def), (float(y_val_min), float(y_val_max)))
 
@@ -297,12 +305,19 @@ col_design, col_obj = st.columns([1, 1])
 # We run this logic first to populate session state, but display it in the columns
 if st.sidebar.button("Initialize System (Gen Data + Train)"):
     # 1. Generate Data
-    cfg = data.DataConfig(
+    # Create moon_prob instance with custom sigma
+    prob_fn = moon_prob()
+    prob_fn.sigma = noise_sigma
+    
+    cfg = SamplingConfig(
         n=n_samples,
         seed=seed,
-        p_fn=lambda x: data.moon_focus_prob(x, sigma=noise_sigma)
+        p_fn=prob_fn
     )
-    X, Y, p1 = data.sample_dataset(cfg)
+    X, Y, p1 = sample_from_config(cfg)
+    X = np.asarray(X)
+    Y = np.asarray(Y)
+    p1 = np.asarray(p1)
     st.session_state.data = (X, Y, p1)
     # Clear previous results
     st.session_state.cf_results = None
@@ -310,7 +325,7 @@ if st.sidebar.button("Initialize System (Gen Data + Train)"):
     st.session_state.F_star = None
     
     # 2. Train Model
-    train_cfg = training.TrainConfig(
+    train_cfg = TrainConfig(
         epochs=n_epochs,
         device=selected_device,
         progress=True
@@ -330,21 +345,25 @@ if st.sidebar.button("Initialize System (Gen Data + Train)"):
         # Generate fresh data for each model to approximate posterior
         # Use a different seed for each model
         model_seed = seed + idx + 1 # Offset from main seed
-        new_cfg = data.DataConfig(
+        # Create moon_prob instance with custom sigma
+        prob_fn = moon_prob()
+        prob_fn.sigma = noise_sigma
+        
+        new_cfg = SamplingConfig(
             n=n_samples,
             seed=model_seed,
-            p_fn=lambda x: data.moon_focus_prob(x, sigma=noise_sigma)
+            p_fn=prob_fn
         )
-        X_new, Y_new, _ = data.sample_dataset(new_cfg)
-        return X_new, Y_new
+        X_new, Y_new, _ = sample_from_config(new_cfg)
+        return np.asarray(X_new), np.asarray(Y_new)
 
     with st.spinner("Training Ensemble..."):
-        results = training.train_ensemble(
+        results = train_ensemble(
             num_models=ensemble_size,
             X=X,
             y=Y,
             cfg=train_cfg,
-            model_factory=lambda: models.SimpleNN(),
+            model_factory=lambda: SimpleNN(),
             resample_fn=resample_fn,
             callback=update_progress
         )
@@ -368,26 +387,22 @@ if st.sidebar.button("Run Counterfactual Search"):
         x_star = torch.tensor([[x_star_x, x_star_y]], dtype=torch.float32).to(device_obj)
         st.session_state.x_star = np.array([x_star_x, x_star_y])  # Store for export
         
-        ensemble_model = models.EnsembleModel(st.session_state.models)
+        ensemble_model = EnsembleModel(st.session_state.models).to(device_obj)
         with torch.no_grad():
             y_pred = ensemble_model(x_star).argmax(dim=1)
         y_target = 1 - y_pred 
         
-        X_obs = torch.tensor(X, dtype=torch.float32)
-        weights = torch.ones(5)
+        X_obs = torch.tensor(X, dtype=torch.float32).to(device_obj)
         
-        cf_cfg = cf_problem.CFConfig(k_neighbors=5, use_soft_validity=True)
-        
-        problem = cf_problem.make_cf_problem(
+        problem = make_cf_problem(
             model=st.session_state.models[0],
-            x_star=x_star.squeeze(0),
+            x_factual=x_star.squeeze(0),
             y_target=y_target,
             X_obs=X_obs,
-            weights=weights,
-            config=cf_cfg,
-            ensemble=st.session_state.models,
-            bayesian_model=ensemble_model,
-            device=torch.device(selected_device)
+            k_neighbors=5,
+            use_soft_validity=True,
+            ensemble=ensemble_model,
+            device=device_obj
         )
         
         algorithm = NSGA2(pop_size=pop_size)
@@ -434,7 +449,8 @@ with col_design:
     st.subheader("Design Space (Input & ML Model)")
     if st.session_state.models is not None and st.session_state.data is not None:
         X, Y, _ = st.session_state.data
-        ensemble_model = models.EnsembleModel(st.session_state.models)
+        # Move models to CPU for visualization to avoid CUDA memory issues
+        ensemble_model = EnsembleModel([m.cpu() for m in st.session_state.models])
         
         # Use Global Selection
         highlight_indices = list(st.session_state.global_indices)
@@ -483,13 +499,15 @@ with col_design:
         # Generate Plotly Figure
         # Use stored x_star if available (from import), otherwise use UI values
         x_star_plot = st.session_state.x_star if st.session_state.x_star is not None else np.array([x_star_x, x_star_y])
+        # Create a list of models on CPU for plotting
+        models_cpu = [m.cpu() for m in st.session_state.models]
         fig1 = plotting.get_design_space_fig(
             ensemble_model, 
             X_plot, 
             Y_plot, 
             x_star=x_star_plot,
             pareto_X=pareto_X_plot,
-            device="cpu",
+            device=torch.device("cpu"),
             sampled_size=size_sampled,
             pareto_size=size_pareto,
             x_star_size=size_xstar,
@@ -497,7 +515,7 @@ with col_design:
             x_range=custom_x_range,
             y_range=custom_y_range,
             background_type=background_type,
-            models=st.session_state.models,
+            models=models_cpu,
             n_contours=n_contours,
             X_indices=X_indices,
             pareto_indices=pareto_indices,

@@ -5,7 +5,7 @@ from typing import Optional, Tuple, List, Any
 import numpy as np
 import torch
 from torch import nn
-from .models import SimpleNN
+from core.models import SimpleNN
 
 
 @dataclass
