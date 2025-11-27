@@ -24,6 +24,7 @@ from core.cf_problem import make_cf_problem
 from vis_tools import plotting, state
 
 PANEL_HEIGHT = 500
+SIZE_3D_FACTOR = 0.5  # 3D points are 0.5× the size of 2D points
 
 st.set_page_config(page_title="uamocf: Uncertainty-Aware Multi-Objective Counterfactuals", layout="wide")
 
@@ -678,7 +679,7 @@ with col_obj:
                         x=F_obs[:, 1], y=F_obs[:, 0], z=-F_obs[:, 3],
                         mode='markers',
                         marker=dict(
-                            size=3, 
+                            size=size_context * SIZE_3D_FACTOR, 
                             color='green', 
                             opacity=context_opacity
                         ),
@@ -693,7 +694,7 @@ with col_obj:
                     x=F_invalid[:, 1], y=F_invalid[:, 0], z=-F_invalid[:, 3],
                     mode='markers',
                     marker=dict(
-                        size=size_pareto, 
+                        size=size_pareto * SIZE_3D_FACTOR, 
                         color='blue', 
                         symbol='cross',
                         opacity=pareto_opacity
@@ -709,7 +710,7 @@ with col_obj:
                     x=F_valid[:, 1], y=F_valid[:, 0], z=-F_valid[:, 3],
                     mode='markers',
                     marker=dict(
-                        size=size_pareto, 
+                        size=size_pareto * SIZE_3D_FACTOR, 
                         color='red', 
                         symbol='cross',
                         opacity=pareto_opacity
@@ -734,7 +735,7 @@ with col_obj:
             fig_3d.add_trace(go.Scatter3d(
                 x=x_star_obj_x, y=x_star_obj_y, z=x_star_obj_z, 
                 mode='markers',
-                marker=dict(size=size_xstar, color='purple'),
+                marker=dict(size=size_xstar * SIZE_3D_FACTOR, color='purple'),
                 name='Factual Instance x* in Obj Space'
             ))
             
