@@ -372,6 +372,7 @@ if st.sidebar.button("Initialize System (Gen Data + Train)"):
     status_text.empty()
     st.session_state.models = [res.model for res in results]
     st.success("System Initialized!")
+    st.rerun()  # Rerun to update design space range based on new data
 
 # --- Logic: Search ---
 if st.sidebar.button("Run Counterfactual Search"):
@@ -857,6 +858,7 @@ with col_par:
         # 1. Observed Data
         if par_coords_source in ["Observed Data", "All"]:
             df_obs = pd.DataFrame(F_obs, columns=['Validity', 'Epistemic', 'Sparsity', 'Aleatoric'])
+            df_obs['Aleatoric'] = -df_obs['Aleatoric']  # Negate to show positive values
             df_obs['x1'] = X_obs[:, 0]
             df_obs['x2'] = X_obs[:, 1]
             df_obs['Type'] = 0.0 # 0 for Observed
@@ -867,6 +869,7 @@ with col_par:
         if par_coords_source in ["Pareto Front", "All"]:
             if F_cf is not None and X_cf is not None:
                 df_cf = pd.DataFrame(F_cf, columns=['Validity', 'Epistemic', 'Sparsity', 'Aleatoric'])
+                df_cf['Aleatoric'] = -df_cf['Aleatoric']  # Negate to show positive values
                 df_cf['x1'] = X_cf[:, 0]
                 df_cf['x2'] = X_cf[:, 1]
                 df_cf['Type'] = 1.0 # 1 for Pareto
@@ -876,16 +879,26 @@ with col_par:
         if df_list:
             df_res = pd.concat(df_list, ignore_index=True)
             
-            # Apply Objective Filters
-            mask_filters = filter_mask(df_res[['Validity', 'Epistemic', 'Sparsity', 'Aleatoric']].values, obj_filters)
+            # Apply Objective Filters (need to handle negated Aleatoric)
+            # Create a copy of filters with negated Aleatoric range
+            adjusted_filters = obj_filters.copy()
+            if 'Aleatoric' in adjusted_filters and isinstance(adjusted_filters['Aleatoric'], tuple):
+                ale_min, ale_max = adjusted_filters['Aleatoric']
+                # Negate and swap (since we negated the values, the range needs to be negated too)
+                adjusted_filters['Aleatoric'] = (-ale_max, -ale_min)
+            
+            mask_filters = filter_mask(df_res[['Validity', 'Epistemic', 'Sparsity', 'Aleatoric']].values, adjusted_filters)
             if mask_filters is not None:
                 df_res = df_res[mask_filters]
             
-            # Filter based on selection
+            # Filter based on selection (only if selection is not empty)
             highlight_indices = list(st.session_state.global_indices)
             if highlight_indices:
-                # Filter by Global_Index
-                df_res = df_res[df_res['Global_Index'].isin(highlight_indices)]
+                # Check if any selected indices are in the current data source
+                selected_in_source = df_res[df_res['Global_Index'].isin(highlight_indices)]
+                if not selected_in_source.empty:
+                    # Only filter if we have matches
+                    df_res = selected_in_source
 
             if not df_res.empty:
                 # Dimensions to show
@@ -932,7 +945,7 @@ with col_det:
                  if idx < len(X_obs):
                      row = {"Type": "Observed", "Index": idx, "x1": X_obs[idx, 0], "x2": X_obs[idx, 1]}
                      if F_obs is not None and idx < len(F_obs):
-                         row.update({"Validity": F_obs[idx, 0], "Epistemic": F_obs[idx, 1], "Sparsity": F_obs[idx, 2], "Aleatoric": F_obs[idx, 3]})
+                         row.update({"Validity": F_obs[idx, 0], "Epistemic": F_obs[idx, 1], "Sparsity": F_obs[idx, 2], "Aleatoric": -F_obs[idx, 3]})  # Negate aleatoric
                      rows.append(row)
 
         # 2. Pareto Points
@@ -944,7 +957,7 @@ with col_det:
                 for idx in par_indices:
                     if 0 <= idx < len(X_cf):
                         row = {"Type": "Pareto", "Index": idx + N, "x1": X_cf[idx, 0], "x2": X_cf[idx, 1]}
-                        row.update({"Validity": F_cf[idx, 0], "Epistemic": F_cf[idx, 1], "Sparsity": F_cf[idx, 2], "Aleatoric": F_cf[idx, 3]})
+                        row.update({"Validity": F_cf[idx, 0], "Epistemic": F_cf[idx, 1], "Sparsity": F_cf[idx, 2], "Aleatoric": -F_cf[idx, 3]})  # Negate aleatoric
                         rows.append(row)
         
         if rows:

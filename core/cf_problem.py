@@ -182,7 +182,7 @@ def make_cf_problem(
     k_neighbors: int = 10,
     use_soft_validity: bool = True,
     normalize_similarity: bool = True,
-    sparsity_eps: float = 0.5,
+    sparsity_eps: float = 0.005,
     ensemble: Optional[EnsembleModel] = None,
     device: Optional[torch.device] = None,
 ) -> FunctionalProblem:
