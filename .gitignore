@@ -11,5 +11,7 @@ wheels/
 
 # pkl files
 *.pkl
+*.pth
+*.gz
 
-
+data/

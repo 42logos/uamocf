@@ -17,6 +17,10 @@ class DataGenerator(ABC):
             y: Labels in one-hot encoding, shape (n, n_classes)
         """
         pass
+    
+    def plot(self):
+        """Plot the data distribution. Only for 2D data."""
+        pass
 
 #abstract class for Probability Function
 class Prob_FN(ABC):
@@ -59,6 +63,23 @@ class DatasetsDG(DataGenerator):
         X = torch.stack(x)
         y = torch.nn.functional.one_hot(torch.tensor(y), num_classes=self.num_classes).float()
         return X, y
+    
+    
+    def plot(self):
+        if self.dataset[0][0].ndim != 1 or self.dataset[0][0].shape[0] != 2:
+            raise ValueError("Plotting is only supported for 2D data.")
+        
+        X = torch.stack([self.dataset[i][0] for i in range(len(self.dataset))]).numpy() if  isinstance(self.dataset[0][0], torch.Tensor) else np.array([self.dataset[i][0] for i in range(len(self.dataset))])
+        y = np.array([self.dataset[i][1] for i in range(len(self.dataset))]) 
+        
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 6))
+        scatter = plt.scatter(X[:, 0], X[:, 1], c=y, cmap='viridis', alpha=0.7)
+        plt.xlabel('Feature 1')
+        plt.ylabel('Feature 2')
+        plt.title('Dataset Visualization')
+        plt.colorbar(scatter)
+        plt.show()
     
 class PlaneDG(DataGenerator):
     def __init__(self, p_fn: Prob_FN):

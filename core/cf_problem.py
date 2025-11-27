@@ -79,17 +79,18 @@ def _k_nearest(x: Array, X_obs: Array, k: int) -> Tuple[Array, Array]:
     return X_obs[nearest_idx], dists[nearest_idx]
 
 
-def aleatoric_from_models(model_ensemble:EnsembleModel, x: Array, device: Optional[torch.device]=None) -> Union[float, Array]:
+def aleatoric_from_models(model_ensemble:EnsembleModel, x: Array) -> Array:
     """
     Average aleatoric uncertainty across an ensemble of models.
     Supports both single point (d,) and batch (N, d).
     """
-    x = np.asarray(x)
+
     is_batch = x.ndim > 1
     if not is_batch:
         x = x[None, :] # (1, d)
         
-    x_t = torch.from_numpy(x.astype(np.float32)).to(device)
+    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
+    x_t = x_t.to(model_ensemble.device)
     
     # Collect probabilities from all models
     all_probs = []
@@ -108,39 +109,70 @@ def aleatoric_from_models(model_ensemble:EnsembleModel, x: Array, device: Option
     mean_entropy = torch.mean(entropies, dim=0).cpu().numpy() # (N,)
     
     if not is_batch:
-        return float(mean_entropy[0])
+        return mean_entropy
     return mean_entropy
 
 def Total_uncertainty(model_ensemble:EnsembleModel, x: Array, device: Optional[torch.device]=None) -> Union[float, Array]:
     """
-    Entropy of the predictive distribution from a single model.
+    Total uncertainty = Entropy of the mean predictive distribution.
+    
+    Correct formulation:
+    1. Get softmax probabilities from each model
+    2. Average the probabilities (not logits!)
+    3. Compute entropy of the averaged distribution
+    
     Supports both single point (d,) and batch (N, d).
     """
     is_batch = x.ndim > 1
     if not is_batch:
-        x = x[None, :]
+        x = x[None, :]  # (1, d)
     
     if device is None:
         device = model_ensemble.device
-    x = torch.from_numpy(x.astype(np.float32)).to(device) if isinstance(x, np.ndarray) else x.to(device)
-
+    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
+    x_t = x_t.to(device)
+    
+    # Collect probabilities from all models
+    all_probs = []
     with torch.no_grad():
-        probs = torch.softmax(model_ensemble(x), dim=-1)
-        
-    ent = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1).cpu().numpy()  # (N,)
+        for m in model_ensemble.models:
+            logits = m(x_t)
+            probs = torch.softmax(logits, dim=-1)
+            all_probs.append(probs)
+    
+    # Stack: (n_models, N, n_classes)
+    all_probs = torch.stack(all_probs)
+    
+    # Mean probabilities across models: (N, n_classes)
+    mean_probs = torch.mean(all_probs, dim=0)
+    
+    # Total uncertainty = entropy of mean prediction
+    ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-12), dim=-1).cpu().numpy()  # (N,)
     
     if not is_batch:
         return float(ent[0])
     return ent
 
-def epistemic_from_models(model_ensemble:EnsembleModel, x: Array, device: Optional[torch.device]=None) -> Union[float, Array]:
+def epistemic_from_models(model_ensemble:EnsembleModel, x: Array) -> Union[float, Array]:
     """
     Epistemic uncertainty from an ensemble of models.
+    
+    EU = TU - AU = H[E[p]] - E[H[p]]
+    
+    Where:
+    - TU = Total Uncertainty = Entropy of mean prediction
+    - AU = Aleatoric Uncertainty = Mean of individual entropies
+    - EU = Epistemic Uncertainty = Disagreement between models
+    
+    EU is always >= 0 by Jensen's inequality.
+    
     Supports both single point (d,) and batch (N, d).
     """
-    AU=aleatoric_from_models(model_ensemble, x, device)
-    TU=Total_uncertainty(model_ensemble, x, device)
-    return TU - AU
+    AU = aleatoric_from_models(model_ensemble, x)
+    TU = Total_uncertainty(model_ensemble, x)
+    EU = TU - AU
+    # EU should be non-negative by Jensen's inequality, but clamp for numerical stability
+    return np.maximum(EU, 0.0)
 
 def make_cf_problem(
     model: nn.Module,
@@ -259,15 +291,27 @@ def make_cf_problem(
         """Aleatoric Uncertainty (negated to maximize)."""
         if ensemble is None or len(ensemble.models) == 0:
             raise ValueError("Ensemble required for aleatoric uncertainty.")
-        au = aleatoric_from_models(ensemble, x, device)
-        return -au  # Negative to maximize AU
+        au = aleatoric_from_models(ensemble, x)
+        if isinstance(au, np.ndarray) and au.ndim > 0:
+            au = au[0]
+        elif isinstance(au, np.ndarray) and au.ndim == 0:
+            au = au.item()
+        elif isinstance(au, torch.Tensor) and au.ndim > 0:
+            au = au[0].item()
+        return float(-au)  # Negative to maximize AU
     
     def o6_epistemic_uncertainty(x: Array) -> float:
         """Epistemic Uncertainty (minimize - prefer confident regions)."""
         if ensemble is None or len(ensemble.models) == 0:
             raise ValueError("Ensemble required for epistemic uncertainty.")
-        eu = epistemic_from_models(ensemble, x, device)
-        return eu  # Positive to minimize EU (prefer low epistemic uncertainty)
+        eu = epistemic_from_models(ensemble, x)
+        if isinstance(eu, np.ndarray) and eu.ndim > 0:
+            eu = eu[0]
+        elif isinstance(eu, np.ndarray) and eu.ndim == 0:
+            eu = eu.item()
+        elif isinstance(eu, torch.Tensor) and eu.ndim > 0:
+            eu = eu[0].item()
+        return float(eu)  # Positive to minimize EU (prefer low epistemic uncertainty)
     
     # Build objective list based on available ensemble
     # Order: [Validity, Sparsity, AU (maximize), EU (minimize)]
