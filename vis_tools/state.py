@@ -26,61 +26,6 @@ class AppState:
     x_star: Optional[np.ndarray]
 
 
-def from_experiment_artifacts(artifacts: Any, x_star: Optional[np.ndarray] = None) -> AppState:
-    """
-    Convert ExperimentArtifacts from pipeline to AppState.
-    
-    Args:
-        artifacts: ExperimentArtifacts from pipeline.run_experiment()
-        x_star: Optional factual point coordinates (uses artifacts default if None)
-        
-    Returns:
-        AppState ready for export or use in visualization
-    """
-    # Extract data tuple
-    data = (artifacts.X, artifacts.y, artifacts.p_true)
-    
-    # Extract models from ensemble
-    models = [r.model for r in artifacts.ensemble]
-    
-    # Create CF result
-    cf_results = CFResult(
-        X=artifacts.nsga_result.X,
-        F=artifacts.nsga_result.F
-    )
-    
-    # Calculate F_obs (objectives for observed data)
-    try:
-        F_obs = np.array(artifacts.problem.evaluate(artifacts.X))
-    except Exception:
-        # Fallback to loop evaluation
-        F_list = []
-        for i in range(len(artifacts.X)):
-            f = artifacts.problem.evaluate(artifacts.X[i:i+1])
-            F_list.append(f[0] if len(f.shape) > 1 else f)
-        F_obs = np.array(F_list)
-    
-    # Calculate F_star (objectives for factual point)
-    if x_star is None:
-        # Try to get from problem or use first data point
-        x_star = artifacts.X[0]
-    
-    try:
-        x_star_arr = np.asarray(x_star)
-        F_star = np.array(artifacts.problem.evaluate(x_star_arr.reshape(1, -1)))
-    except Exception:
-        F_star = None
-    
-    return AppState(
-        data=data,
-        models=models,
-        cf_results=cf_results,
-        F_obs=F_obs,
-        F_star=F_star,
-        x_star=x_star
-    )
-
-
 def export_state(data, models, cf_results, F_obs, F_star=None, x_star=None):
     """
     Serializes the application state into a bytes object.
@@ -115,39 +60,6 @@ def export_state(data, models, cf_results, F_obs, F_star=None, x_star=None):
     return buffer.getvalue()
 
 
-def export_app_state(app_state: AppState) -> bytes:
-    """
-    Export AppState to bytes.
-    
-    Args:
-        app_state: AppState object
-        
-    Returns:
-        Serialized bytes
-    """
-    return export_state(
-        data=app_state.data,
-        models=app_state.models,
-        cf_results=app_state.cf_results,
-        F_obs=app_state.F_obs,
-        F_star=app_state.F_star,
-        x_star=app_state.x_star
-    )
-
-
-def save_state(app_state: AppState, filepath: str) -> None:
-    """
-    Save AppState to a file.
-    
-    Args:
-        app_state: AppState object
-        filepath: Path to save the state file
-    """
-    state_bytes = export_app_state(app_state)
-    with open(filepath, 'wb') as f:
-        f.write(state_bytes)
-
-
 def import_state(file_obj, device):
     """
     Deserializes the application state from a file-like object.
@@ -180,6 +92,26 @@ def import_state(file_obj, device):
     return data, models, cf_results, F_obs, F_star, x_star
 
 
+def save_state(app_state: AppState, filepath: str) -> None:
+    """
+    Save AppState to a file.
+    
+    Args:
+        app_state: AppState object
+        filepath: Path to save the state file
+    """
+    state_bytes = export_state(
+        data=app_state.data,
+        models=app_state.models,
+        cf_results=app_state.cf_results,
+        F_obs=app_state.F_obs,
+        F_star=app_state.F_star,
+        x_star=app_state.x_star
+    )
+    with open(filepath, 'wb') as f:
+        f.write(state_bytes)
+
+
 def load_state(filepath: str, device: Optional[torch.device] = None) -> AppState:
     """
     Load AppState from a file.
@@ -205,3 +137,104 @@ def load_state(filepath: str, device: Optional[torch.device] = None) -> AppState
         F_star=F_star,
         x_star=x_star
     )
+
+
+def create_state_from_pymoo_result(
+    X: np.ndarray,
+    y: np.ndarray,
+    models: List[nn.Module],
+    pymoo_result: Any,
+    problem: Any,
+    x_star: np.ndarray,
+    p_true: Optional[np.ndarray] = None,
+) -> AppState:
+    """
+    Create an AppState from pymoo optimization result and problem.
+    
+    This is the recommended interface - it automatically calculates F_obs and F_star
+    from the problem object.
+    
+    Args:
+        X: Training data features, shape (n_samples, n_features)
+        y: Training data labels, shape (n_samples,)
+        models: List of trained PyTorch models (ensemble)
+        pymoo_result: Result object from pymoo minimize() with .X and .F attributes
+        problem: The pymoo Problem used for optimization (has .evaluate() method)
+        x_star: Factual point coordinates, shape (n_features,)
+        p_true: Optional true probability values, shape (n_samples,)
+    
+    Returns:
+        AppState object ready to be saved with save_state()
+    """
+    # Create p_true if not provided
+    if p_true is None:
+        p_true = np.zeros(len(y), dtype=np.float32)
+    
+    # Create data tuple
+    data = (X, y, p_true)
+    
+    # Extract CF results from pymoo result
+    cf_results = CFResult(X=pymoo_result.X, F=pymoo_result.F)
+    
+    # Calculate F_obs (objectives for observed data)
+    try:
+        F_obs = np.array(problem.evaluate(X))
+    except Exception:
+        F_list = []
+        for i in range(len(X)):
+            f = problem.evaluate(X[i:i+1])
+            F_list.append(f[0] if len(f.shape) > 1 else f)
+        F_obs = np.array(F_list)
+    
+    # Calculate F_star (objectives for factual point)
+    x_star = np.asarray(x_star)
+    try:
+        F_star = np.array(problem.evaluate(x_star.reshape(1, -1)))
+    except Exception:
+        F_star = None
+    
+    return AppState(
+        data=data,
+        models=models,
+        cf_results=cf_results,
+        F_obs=F_obs,
+        F_star=F_star,
+        x_star=x_star
+    )
+
+
+def create_and_save_state(
+    filepath: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    models: List[nn.Module],
+    pymoo_result: Any,
+    problem: Any,
+    x_star: np.ndarray,
+    p_true: Optional[np.ndarray] = None,
+) -> AppState:
+    """
+    Create and save state from pymoo result in one step.
+    
+    This is the simplest interface - just pass your data, models, and pymoo result.
+    
+    Args:
+        filepath: Path to save the state file
+        X: Training data features, shape (n_samples, n_features)
+        y: Training data labels, shape (n_samples,)
+        models: List of trained PyTorch models (ensemble)
+        pymoo_result: Result object from pymoo minimize() with .X and .F attributes
+        problem: The pymoo Problem used for optimization
+        x_star: Factual point coordinates, shape (n_features,)
+        p_true: Optional true probability values
+    
+    Returns:
+        AppState object that was saved
+    """
+    app_state = create_state_from_pymoo_result(
+        X=X, y=y, models=models,
+        pymoo_result=pymoo_result, problem=problem, x_star=x_star,
+        p_true=p_true
+    )
+    save_state(app_state, filepath)
+    return app_state
