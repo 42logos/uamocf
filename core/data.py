@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, List, Optional, Tuple, Literal, Sized
 import numpy as np
 from numpy.typing import ArrayLike
 import torch
 from torch.utils.data import Dataset
+
+Array = np.ndarray
 
 # abstract class for data generator
 class DataGenerator(ABC):
@@ -175,3 +178,97 @@ class moon_prob(Prob_FN):
             probs = probs / probs.sum(axis=-1, keepdims=True)
         
         return probs
+
+
+# -----------------------------
+# Sampling utilities for 2-class synthetic experiments
+# -----------------------------
+
+@dataclass
+class SamplingConfig:
+    """Configuration for synthetic dataset sampling."""
+    n: int = 1500
+    d: int = 2
+    low: float = -1.0
+    high: float = 1.0
+    seed: Optional[int] = 42
+    p_fn: Optional[Callable[[ArrayLike], ArrayLike]] = None
+
+    def make_sampler(self) -> Callable[..., ArrayLike]:
+        """Create a uniform sampler with configured bounds."""
+        rng = np.random.default_rng(self.seed)
+        return partial(rng.uniform, low=self.low, high=self.high)
+
+
+def dpg(
+    n: int,
+    x_sampler: Callable[..., ArrayLike],
+    p_fn: Callable[[ArrayLike], ArrayLike],
+    d: int = 2,
+    rng: Optional[np.random.Generator] = None,
+    x_sampler_kwargs: Optional[dict] = None,
+) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """
+    Data Point Generator - draws (X, Y) pairs from a probability surface.
+    
+    X ~ P_X (via x_sampler)
+    Y|X ~ Bernoulli(p_fn(X)) for 2-class, or Categorical for multi-class
+    
+    Args:
+        n: Number of samples
+        x_sampler: Callable that returns feature samples
+        p_fn: Probability function P(Y=1|X) or full class probabilities
+        d: Feature dimensionality
+        rng: Random generator for reproducibility
+        x_sampler_kwargs: Additional kwargs for x_sampler
+        
+    Returns:
+        X: Features (n, d)
+        Y: Labels (n,)
+        p: Underlying probability values (n,) or (n, n_classes)
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    x_sampler_kwargs = {} if x_sampler_kwargs is None else dict(x_sampler_kwargs)
+
+    if "size" not in x_sampler_kwargs:
+        x_sampler_kwargs["size"] = (n, d)
+
+    X = np.asarray(x_sampler(**x_sampler_kwargs))
+    p = p_fn(X)
+    
+    # Handle both scalar probability (2-class) and full probability distribution
+    p_arr = np.asarray(p)
+    if p_arr.ndim == 2:
+        # Multi-class: p is (n, n_classes), sample from categorical
+        Y = np.array([rng.choice(p_arr.shape[1], p=p_arr[i]) for i in range(n)], dtype=np.int64)
+        p_return = p_arr[:, 1] if p_arr.shape[1] == 2 else p_arr  # For 2-class, return P(Y=1)
+    else:
+        # Binary: p is P(Y=1)
+        p1 = np.clip(p_arr, 0.0, 1.0)
+        Y = rng.binomial(1, p1).astype(np.int64)
+        p_return = p1
+    
+    return X, Y, p_return
+
+
+def sample_from_config(cfg: SamplingConfig) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """
+    Convenience wrapper to sample a dataset from a SamplingConfig.
+    
+    Args:
+        cfg: Sampling configuration
+        
+    Returns:
+        X, Y, p_true
+    """
+    if cfg.p_fn is None:
+        # Default to moon probability - return P(Y=1) for 2-class
+        _moon = moon_prob()
+        def _default_p_fn(x: ArrayLike) -> np.ndarray:
+            result = np.asarray(_moon(x))
+            return result[:, 1] if result.ndim > 1 else result[1]
+        cfg.p_fn = _default_p_fn
+    
+    rng = np.random.default_rng(cfg.seed)
+    sampler = cfg.make_sampler()
+    return dpg(cfg.n, sampler, cfg.p_fn, d=cfg.d, rng=rng)

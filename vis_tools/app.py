@@ -29,6 +29,10 @@ if "cf_results" not in st.session_state:
     st.session_state.cf_results = None
 if "F_obs" not in st.session_state:
     st.session_state.F_obs = None
+if "F_star" not in st.session_state:
+    st.session_state.F_star = None
+if "x_star" not in st.session_state:
+    st.session_state.x_star = None
 
 # --- Sidebar Controls ---
 
@@ -69,7 +73,9 @@ with st.sidebar.expander("State Management", expanded=False):
             st.session_state.data,
             st.session_state.models,
             st.session_state.cf_results,
-            st.session_state.F_obs
+            st.session_state.F_obs,
+            st.session_state.F_star,
+            st.session_state.x_star
         )
         st.download_button(
             label="Download State",
@@ -87,15 +93,21 @@ with st.sidebar.expander("State Management", expanded=False):
             try:
                 # Determine device
                 device = torch.device(selected_device)
-                d, m, cf, f_obs = state.import_state(uploaded_file, device=device)
+                # Reset file position in case it was read before
+                uploaded_file.seek(0)
+                d, m, cf, f_obs, f_star, x_star_loaded = state.import_state(uploaded_file, device=device)
                 st.session_state.data = d
-                st.session_state.models = m
+                st.session_state.models = m if m else None  # Convert empty list to None
                 st.session_state.cf_results = cf
                 st.session_state.F_obs = f_obs
+                st.session_state.F_star = f_star
+                st.session_state.x_star = x_star_loaded
                 st.success("State loaded successfully!")
                 st.rerun()
             except Exception as e:
+                import traceback
                 st.error(f"Error loading state: {e}")
+                st.code(traceback.format_exc())
 
 # 3. System Configuration
 with st.sidebar.expander("System Configuration", expanded=False):
@@ -332,6 +344,7 @@ if st.sidebar.button("Initialize System (Gen Data + Train)"):
             X=X,
             y=Y,
             cfg=train_cfg,
+            model_factory=lambda: models.SimpleNN(),
             resample_fn=resample_fn,
             callback=update_progress
         )
@@ -353,6 +366,7 @@ if st.sidebar.button("Run Counterfactual Search"):
 
         X, Y, _ = st.session_state.data
         x_star = torch.tensor([[x_star_x, x_star_y]], dtype=torch.float32).to(device_obj)
+        st.session_state.x_star = np.array([x_star_x, x_star_y])  # Store for export
         
         ensemble_model = models.EnsembleModel(st.session_state.models)
         with torch.no_grad():
@@ -467,11 +481,13 @@ with col_design:
                 pareto_indices = pareto_indices[mask_par]
 
         # Generate Plotly Figure
+        # Use stored x_star if available (from import), otherwise use UI values
+        x_star_plot = st.session_state.x_star if st.session_state.x_star is not None else np.array([x_star_x, x_star_y])
         fig1 = plotting.get_design_space_fig(
             ensemble_model, 
             X_plot, 
             Y_plot, 
-            x_star=np.array([x_star_x, x_star_y]),
+            x_star=x_star_plot,
             pareto_X=pareto_X_plot,
             device="cpu",
             sampled_size=size_sampled,

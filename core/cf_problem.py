@@ -247,7 +247,12 @@ def make_cf_problem(
         """Convert flat array to tensor with proper shape for model."""
         x_t = _to_tensor(x)
         # Reshape to original input shape (e.g., (1, 1, 16, 16) for CNN)
-        return x_t.view(input_shape)
+        reshaped = x_t.view(input_shape)
+        # Ensure batch dimension exists
+        if reshaped.dim() == len(input_shape) and input_shape[0] != 1:
+            # No batch dimension, add one
+            reshaped = reshaped.unsqueeze(0)
+        return reshaped
     
     # OBJECTIVE FUNCTIONS 
     def o1_validity(x: Array) -> float:
@@ -255,7 +260,11 @@ def make_cf_problem(
         x_t = _to_model_input(x)
         
         with torch.no_grad():
-            probs = nn.Softmax(dim=1)(model(x_t))
+            logits = model(x_t)
+            # Handle both 1D and 2D outputs
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            probs = torch.softmax(logits, dim=1)
         
         if use_soft_validity:
             prob_target = probs[0, target_labels].sum().item()
@@ -314,13 +323,14 @@ def make_cf_problem(
         return float(eu)  # Positive to minimize EU (prefer low epistemic uncertainty)
     
     # Build objective list based on available ensemble
-    # Order: [Validity, Sparsity, AU (maximize), EU (minimize)]
+    # Order: [Validity, Epistemic, Sparsity, Aleatoric]
+    # This order matches what vis_tools/app.py expects
     if ensemble is not None and len(ensemble.models) > 0:
         objectives = [
-            o1_validity,           # Minimize 1 - P(target)
-            o3_sparsity,           # Minimize changed features
-            o5_aleatoric_uncertainty,  # Maximize AU (minimize -AU)
-            o6_epistemic_uncertainty,  # Minimize EU (prefer confident regions)
+            o1_validity,               # Index 0: Minimize 1 - P(target)
+            o6_epistemic_uncertainty,  # Index 1: Minimize EU (prefer confident regions)
+            o3_sparsity,               # Index 2: Minimize changed features
+            o5_aleatoric_uncertainty,  # Index 3: Maximize AU (minimize -AU)
         ]
     else:
         objectives = [

@@ -5,6 +5,8 @@ Orchestrates the synthetic experiment:
 2) train base model
 3) train ensemble
 4) build and solve the multi-objective CF problem
+
+Uses core.optimization for NSGA-II configuration and execution.
 """
 
 from __future__ import annotations
@@ -14,10 +16,16 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.optimize import minimize
-from pymoo.termination import get_termination
 from torch import nn
+
+# Import from core
+from core.optimization import (
+    NSGAConfig,
+    run_nsga,
+    FactualBasedSampling,
+    MixedSampling,
+    ValidCFCallback,
+)
 
 from .cf_problem import CFConfig, make_cf_problem
 from .data import DataConfig, sample_dataset
@@ -26,13 +34,8 @@ from .training import TrainConfig, TrainResult, train_model, train_ensemble
 
 Array = np.ndarray
 
-
-@dataclass
-class NSGACfg:
-    pop_size: int = 50
-    n_gen: int = 350
-    seed: Optional[int] = None
-    verbose: bool = True
+# Re-export NSGAConfig as NSGACfg for backward compatibility
+NSGACfg = NSGAConfig
 
 
 @dataclass
@@ -81,12 +84,6 @@ def _train_ensemble(data_cfg: DataConfig, train_cfg: TrainConfig, ensemble_size:
         model_factory=lambda: SimpleNN(),
         resample_fn=resample_fn,
     )
-
-
-def run_nsga(problem, cfg: NSGACfg):
-    algorithm = NSGA2(pop_size=cfg.pop_size)
-    termination = get_termination("n_gen", cfg.n_gen)
-    return minimize(problem, algorithm, termination, verbose=cfg.verbose, seed=cfg.seed)
 
 
 def run_experiment(cfg: ExperimentConfig) -> ExperimentArtifacts:
