@@ -4,9 +4,9 @@ NSGA-II optimization utilities for counterfactual generation.
 Provides custom sampling, callbacks, and termination criteria for
 multi-objective counterfactual optimization.
 
-Includes MOC-style modified crowding distance that combines:
-- Objective space diversity (L1 norm)
-- Feature space diversity (Gower distance)
+Includes MOC-style modifications:
+- Modified crowding distance (objective space L1 + feature space Gower)
+- Conditional Mutator (samples from conditional distributions using transformation trees)
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.callback import Callback
+from pymoo.core.mutation import Mutation
 from pymoo.core.population import Population
 from pymoo.core.problem import Problem
 from pymoo.core.result import Result
@@ -33,6 +34,269 @@ import torch
 
 
 Array = Union[np.ndarray, torch.Tensor]
+
+
+# =============================================================================
+# Conditional Mutator using Transformation Trees
+# =============================================================================
+
+class TransformationTree:
+    """
+    A transformation tree for conditional sampling of feature values.
+    
+    Uses a Decision Tree Regressor to model the conditional distribution
+    P(x_j | x_{-j}) for numerical features, enabling plausible mutations.
+    """
+    
+    def __init__(self, feature_idx: int, max_depth: int = 5, min_samples_leaf: int = 10):
+        """
+        Args:
+            feature_idx: Index of the feature this tree predicts
+            max_depth: Maximum depth of the decision tree
+            min_samples_leaf: Minimum samples per leaf for variance estimation
+        """
+        self.feature_idx = feature_idx
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.tree = None
+        self.leaf_stats: Dict[int, Tuple[float, float]] = {}  # leaf_id -> (mean, std)
+        self._is_fitted = False
+    
+    def fit(self, X_obs: np.ndarray) -> 'TransformationTree':
+        """
+        Train the transformation tree on observed data.
+        
+        Args:
+            X_obs: Observed training data, shape (n_samples, n_features)
+            
+        Returns:
+            self
+        """
+        from sklearn.tree import DecisionTreeRegressor
+        
+        n_samples, n_features = X_obs.shape
+        
+        # Target: the feature we want to predict
+        y = X_obs[:, self.feature_idx]
+        
+        # Features: all other features (exclude the target feature)
+        feature_mask = np.ones(n_features, dtype=bool)
+        feature_mask[self.feature_idx] = False
+        X = X_obs[:, feature_mask]
+        
+        # Train decision tree
+        self.tree = DecisionTreeRegressor(
+            max_depth=self.max_depth,
+            min_samples_leaf=self.min_samples_leaf,
+            random_state=42
+        )
+        self.tree.fit(X, y)
+        
+        # Compute statistics for each leaf node
+        leaf_ids = self.tree.apply(X)
+        unique_leaves = np.unique(leaf_ids)
+        
+        for leaf_id in unique_leaves:
+            mask = leaf_ids == leaf_id
+            leaf_values = y[mask]
+            self.leaf_stats[leaf_id] = (
+                float(np.mean(leaf_values)),
+                float(np.std(leaf_values)) + 1e-6  # Add small epsilon for stability
+            )
+        
+        self._is_fitted = True
+        return self
+    
+    def sample(self, x: np.ndarray, rng: np.random.Generator) -> float:
+        """
+        Sample a plausible value for this feature given other features.
+        
+        Args:
+            x: Current feature vector, shape (n_features,)
+            rng: Random number generator
+            
+        Returns:
+            Sampled feature value from conditional distribution
+        """
+        if not self._is_fitted:
+            raise RuntimeError("TransformationTree must be fitted before sampling")
+        
+        # Prepare input (exclude the target feature)
+        n_features = len(x)
+        feature_mask = np.ones(n_features, dtype=bool)
+        feature_mask[self.feature_idx] = False
+        x_input = x[feature_mask].reshape(1, -1)
+        
+        # Find the leaf node
+        leaf_id = self.tree.apply(x_input)[0]
+        
+        # Get statistics for this leaf
+        if leaf_id in self.leaf_stats:
+            mean, std = self.leaf_stats[leaf_id]
+        else:
+            # Fallback: use tree prediction with small noise
+            mean = self.tree.predict(x_input)[0]
+            std = 0.1
+        
+        # Sample from Gaussian approximation of conditional distribution
+        sampled_value = rng.normal(mean, std)
+        
+        return sampled_value
+
+
+class ConditionalMutator(Mutation):
+    """
+    MOC-style Conditional Mutator for plausible counterfactual generation.
+    
+    Instead of random mutations, this operator samples feature values from
+    their conditional distributions P(x_j | x_{-j}), learned via transformation
+    trees trained on observed data. This produces more plausible mutations
+    that respect the data distribution.
+    
+    Key features:
+    - Trains a transformation tree for each feature on X_obs
+    - Mutates features in randomized order (since mutations are dependent)
+    - Samples new values from conditional distributions
+    
+    Reference: Dandl et al. "Multi-Objective Counterfactual Explanations"
+    """
+    
+    def __init__(self,
+                 X_obs: np.ndarray,
+                 prob: float = 0.2,
+                 max_depth: int = 5,
+                 min_samples_leaf: int = 10,
+                 fallback_std: float = 0.1):
+        """
+        Args:
+            X_obs: Observed training data for learning conditionals, shape (n_samples, n_features)
+            prob: Probability of mutating each feature
+            max_depth: Maximum depth of transformation trees
+            min_samples_leaf: Minimum samples per leaf in trees
+            fallback_std: Standard deviation for fallback random mutation
+        """
+        super().__init__()
+        self.X_obs = np.asarray(X_obs)
+        self.prob = prob
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf
+        self.fallback_std = fallback_std
+        
+        # Build transformation trees for each feature
+        self.n_features = self.X_obs.shape[1]
+        self.trees: List[TransformationTree] = []
+        self._build_trees()
+    
+    def _build_trees(self):
+        """Train a transformation tree for each feature."""
+        for j in range(self.n_features):
+            tree = TransformationTree(
+                feature_idx=j,
+                max_depth=self.max_depth,
+                min_samples_leaf=self.min_samples_leaf
+            )
+            tree.fit(self.X_obs)
+            self.trees.append(tree)
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        """
+        Perform conditional mutation on the population.
+        
+        Args:
+            problem: The optimization problem
+            X: Decision variables of offspring, shape (n_offspring, n_var)
+            
+        Returns:
+            Mutated decision variables
+        """
+        n_offspring, n_var = X.shape
+        X_mutated = X.copy()
+        
+        # Get bounds
+        xl, xu = problem.xl, problem.xu
+        
+        # Random generator
+        rng = np.random.default_rng()
+        
+        for i in range(n_offspring):
+            # Randomize feature order for this individual
+            # (important since mutations are conditionally dependent)
+            feature_order = rng.permutation(n_var)
+            
+            for j in feature_order:
+                # Decide whether to mutate this feature
+                if rng.random() < self.prob:
+                    # Sample from conditional distribution
+                    if j < len(self.trees):
+                        new_value = self.trees[j].sample(X_mutated[i], rng)
+                    else:
+                        # Fallback for features beyond trained trees
+                        current_value = X_mutated[i, j]
+                        feature_range = xu[j] - xl[j]
+                        new_value = current_value + rng.normal(0, self.fallback_std * feature_range)
+                    
+                    # Clip to bounds
+                    X_mutated[i, j] = np.clip(new_value, xl[j], xu[j])
+        
+        return X_mutated
+
+
+class HybridMutator(Mutation):
+    """
+    Hybrid mutation combining Conditional Mutator with Polynomial Mutation.
+    
+    With probability `conditional_prob`, uses the ConditionalMutator for
+    plausible mutations. Otherwise, falls back to standard PM for exploration.
+    """
+    
+    def __init__(self,
+                 X_obs: np.ndarray,
+                 conditional_prob: float = 0.7,
+                 mutation_prob: float = 0.2,
+                 pm_eta: float = 20,
+                 max_depth: int = 5,
+                 min_samples_leaf: int = 10):
+        """
+        Args:
+            X_obs: Observed training data
+            conditional_prob: Probability of using conditional mutation vs PM
+            mutation_prob: Per-feature mutation probability
+            pm_eta: Distribution index for polynomial mutation
+            max_depth: Max depth for transformation trees
+            min_samples_leaf: Min samples per leaf in trees
+        """
+        super().__init__()
+        self.conditional_prob = conditional_prob
+        
+        # Initialize both mutators
+        self.conditional_mutator = ConditionalMutator(
+            X_obs=X_obs,
+            prob=mutation_prob,
+            max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf
+        )
+        self.pm_mutator = PM(prob=mutation_prob, eta=pm_eta)
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        """Apply hybrid mutation."""
+        n_offspring = X.shape[0]
+        X_mutated = X.copy()
+        
+        rng = np.random.default_rng()
+        
+        for i in range(n_offspring):
+            if rng.random() < self.conditional_prob:
+                # Use conditional mutation for this individual
+                X_mutated[i:i+1] = self.conditional_mutator._do(
+                    problem, X_mutated[i:i+1], **kwargs
+                )
+            else:
+                # Use polynomial mutation for exploration
+                X_mutated[i:i+1] = self.pm_mutator._do(
+                    problem, X_mutated[i:i+1], **kwargs
+                )
+        
+        return X_mutated
 
 
 # =============================================================================
@@ -263,6 +527,9 @@ class MOCRankAndCrowdingSurvival(Survival):
             feature_types: Array of 'numerical' or 'categorical' for each feature
             alpha: Weight for objective space distance (0.5 = equal weighting)
             nds: Non-dominated sorting instance
+
+        Returns:
+            
         """
         super().__init__(filter_infeasible=True)
         self.feature_ranges = feature_ranges
@@ -404,6 +671,12 @@ class NSGAConfig:
     use_moc_crowding: bool = True  # Use MOC modified crowding distance
     crowding_alpha: float = 0.5   # Weight for objective space (0.5 = equal weighting)
     feature_types: Optional[np.ndarray] = None  # 'numerical' or 'categorical' per feature
+    
+    # Conditional Mutator parameters (MOC-style)
+    use_conditional_mutator: bool = True  # Use conditional mutator for plausible mutations
+    conditional_mutator_prob: float = 0.7  # Probability of using conditional vs PM mutation
+    tree_max_depth: int = 5  # Max depth of transformation trees
+    tree_min_samples_leaf: int = 10  # Min samples per leaf in transformation trees
 
 class FactualBasedSampling(FloatRandomSampling):
     """
@@ -741,12 +1014,24 @@ def run_nsga(
     problem: Problem,
     config: NSGAConfig,
     sampling: Optional[FloatRandomSampling] = None,
+    X_obs: Optional[np.ndarray] = None,
 ) -> Result:
     """
     Run NSGA-II optimization on the given problem with specified configuration.
     
-    Supports MOC-style modified crowding distance that combines objective
-    space and feature space diversity for counterfactual generation.
+    Supports MOC-style modifications:
+    - Modified crowding distance (objective space + feature space diversity)
+    - Conditional Mutator (plausible mutations via transformation trees)
+    
+    Args:
+        problem: The optimization problem
+        config: NSGA-II configuration
+        sampling: Optional custom sampling strategy
+        X_obs: Observed training data for conditional mutator, shape (n_samples, n_features).
+               Required if config.use_conditional_mutator is True.
+               
+    Returns:
+        Optimization result
     """
     # Use default mutation probability if not specified (1/n_var is default for PM)
     mutation_prob = config.mutation_prob if config.mutation_prob is not None else (1.0 / problem.n_var)
@@ -754,6 +1039,21 @@ def run_nsga(
     # Compute feature ranges from problem bounds
     feature_ranges = problem.xu - problem.xl
     feature_ranges[feature_ranges == 0] = 1.0  # Avoid division by zero
+    
+    # Setup mutation operator
+    if config.use_conditional_mutator and X_obs is not None:
+        # Use MOC-style Conditional Mutator (hybrid with PM)
+        mutation = HybridMutator(
+            X_obs=X_obs,
+            conditional_prob=config.conditional_mutator_prob,
+            mutation_prob=mutation_prob,
+            pm_eta=int(config.mutation_eta),
+            max_depth=config.tree_max_depth,
+            min_samples_leaf=config.tree_min_samples_leaf
+        )
+    else:
+        # Use standard Polynomial Mutation
+        mutation = PM(prob=mutation_prob, eta=int(config.mutation_eta))
     
     if config.use_moc_crowding:
         # Use MOC-style NSGA-II with modified crowding distance
@@ -764,7 +1064,7 @@ def run_nsga(
             crowding_alpha=config.crowding_alpha,
             sampling=sampling or FloatRandomSampling(),
             crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
-            mutation=PM(prob=mutation_prob, eta=int(config.mutation_eta)),
+            mutation=mutation,
             eliminate_duplicates=True,
         )
     else:
@@ -773,7 +1073,7 @@ def run_nsga(
             pop_size=config.pop_size,
             sampling=sampling or FloatRandomSampling(),
             crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
-            mutation=PM(prob=mutation_prob, eta=int(config.mutation_eta)),
+            mutation=mutation,
             eliminate_duplicates=True,
         )
     
