@@ -241,6 +241,69 @@ class ConditionalMutator(Mutation):
         return X_mutated
 
 
+class ResetOperator(Mutation):
+    """
+    MOC-style Reset Operator for counterfactual generation.
+    
+    After recombination and mutation, this operator randomly resets some feature
+    values back to the factual instance x* with a given probability p_reset.
+    This prevents all features from drifting away from x* simultaneously,
+    encouraging sparser counterfactuals.
+    
+    Mathematical formulation:
+    For each feature j independently, with probability p_reset:
+        x_j^new = x_j^*  (reset to factual)
+    Otherwise:
+        x_j^new = x̃_j    (keep mutated value)
+    
+    In vector form with Bernoulli mask B ~ Bernoulli(p_reset)^p:
+        x_new = B ⊙ x* + (1 - B) ⊙ x̃
+    
+    Expected effect on sparsity objective:
+        E[||x_new - x*||_0 | x̃] = (1 - p_reset) * ||x̃ - x*||_0
+    
+    Reference: Dandl et al. "Multi-Objective Counterfactual Explanations"
+    """
+    
+    def __init__(self, x_factual: np.ndarray, p_reset: float = 0.05):
+        """
+        Args:
+            x_factual: The factual instance x*, shape (n_features,) or (1, n_features)
+            p_reset: Probability of resetting each feature to its factual value.
+                     Should be small (e.g., 0.01-0.1) to avoid too much attraction.
+        """
+        super().__init__()
+        self.x_factual = np.asarray(x_factual).flatten()
+        self.p_reset = p_reset
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        """
+        Apply reset operator to the population.
+        
+        For each individual and each feature, with probability p_reset,
+        reset the feature value to the factual value x*_j.
+        
+        Args:
+            problem: The optimization problem
+            X: Decision variables of offspring, shape (n_offspring, n_var)
+            
+        Returns:
+            Decision variables with some features reset to factual values
+        """
+        n_offspring, n_var = X.shape
+        X_reset = X.copy()
+        
+        # Generate Bernoulli mask: B[i,j] = 1 means reset feature j of individual i
+        rng = np.random.default_rng()
+        B = rng.random((n_offspring, n_var)) < self.p_reset
+        
+        # Apply reset: x_new = B ⊙ x* + (1 - B) ⊙ x̃
+        # Where B=1 means use factual, B=0 means keep mutated
+        X_reset = np.where(B, self.x_factual, X_reset)
+        
+        return X_reset
+
+
 class HybridMutator(Mutation):
     """
     Hybrid mutation combining Conditional Mutator with Polynomial Mutation.
@@ -677,6 +740,12 @@ class NSGAConfig:
     conditional_mutator_prob: float = 0.7  # Probability of using conditional vs PM mutation
     tree_max_depth: int = 5  # Max depth of transformation trees
     tree_min_samples_leaf: int = 10  # Min samples per leaf in transformation trees
+    
+    # Reset Operator parameters (MOC-style)
+    # After mutation, randomly reset features to factual values to encourage sparsity
+    use_reset_operator: bool = True  # Enable MOC-style reset operator
+    reset_prob: float = 0.05  # Probability of resetting each feature to factual value
+                              # Should be small (0.01-0.1) to prevent over-attraction to x*
 
 class FactualBasedSampling(FloatRandomSampling):
     """
@@ -1010,11 +1079,53 @@ class ConvergenceTermination(Termination):
         return gen_progress  # Continue
     
     
+class MutationWithReset(Mutation):
+    """
+    Wrapper that applies reset operator after any mutation.
+    
+    This combines any mutation operator with the MOC-style reset operator,
+    applying mutation first and then the reset step.
+    """
+    
+    def __init__(self, mutation: Mutation, reset: ResetOperator):
+        """
+        Args:
+            mutation: The base mutation operator (PM, ConditionalMutator, or HybridMutator)
+            reset: The reset operator to apply after mutation
+        """
+        super().__init__()
+        self.mutation = mutation
+        self.reset = reset
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        """
+        Apply mutation followed by reset.
+        
+        1. First apply the base mutation operator
+        2. Then apply the reset operator to pull some features back to x*
+        
+        Args:
+            problem: The optimization problem
+            X: Decision variables, shape (n_offspring, n_var)
+            
+        Returns:
+            Mutated and reset decision variables
+        """
+        # Step 1: Apply base mutation
+        X_mutated = self.mutation._do(problem, X, **kwargs)
+        
+        # Step 2: Apply reset operator
+        X_reset = self.reset._do(problem, X_mutated, **kwargs)
+        
+        return X_reset
+
+
 def run_nsga(
     problem: Problem,
     config: NSGAConfig,
     sampling: Optional[FloatRandomSampling] = None,
     X_obs: Optional[np.ndarray] = None,
+    x_factual: Optional[np.ndarray] = None,
 ) -> Result:
     """
     Run NSGA-II optimization on the given problem with specified configuration.
@@ -1022,6 +1133,7 @@ def run_nsga(
     Supports MOC-style modifications:
     - Modified crowding distance (objective space + feature space diversity)
     - Conditional Mutator (plausible mutations via transformation trees)
+    - Reset Operator (randomly reset features to factual values for sparsity)
     
     Args:
         problem: The optimization problem
@@ -1029,6 +1141,8 @@ def run_nsga(
         sampling: Optional custom sampling strategy
         X_obs: Observed training data for conditional mutator, shape (n_samples, n_features).
                Required if config.use_conditional_mutator is True.
+        x_factual: The factual instance x*, shape (n_features,) or (1, n_features).
+                   Required if config.use_reset_operator is True.
                
     Returns:
         Optimization result
@@ -1040,10 +1154,10 @@ def run_nsga(
     feature_ranges = problem.xu - problem.xl
     feature_ranges[feature_ranges == 0] = 1.0  # Avoid division by zero
     
-    # Setup mutation operator
+    # Setup base mutation operator
     if config.use_conditional_mutator and X_obs is not None:
         # Use MOC-style Conditional Mutator (hybrid with PM)
-        mutation = HybridMutator(
+        base_mutation = HybridMutator(
             X_obs=X_obs,
             conditional_prob=config.conditional_mutator_prob,
             mutation_prob=mutation_prob,
@@ -1053,7 +1167,19 @@ def run_nsga(
         )
     else:
         # Use standard Polynomial Mutation
-        mutation = PM(prob=mutation_prob, eta=int(config.mutation_eta))
+        base_mutation = PM(prob=mutation_prob, eta=int(config.mutation_eta))
+    
+    # Optionally wrap with reset operator
+    if config.use_reset_operator and x_factual is not None:
+        # Create reset operator
+        reset_op = ResetOperator(
+            x_factual=x_factual,
+            p_reset=config.reset_prob
+        )
+        # Wrap mutation with reset
+        mutation = MutationWithReset(mutation=base_mutation, reset=reset_op)
+    else:
+        mutation = base_mutation
     
     if config.use_moc_crowding:
         # Use MOC-style NSGA-II with modified crowding distance
