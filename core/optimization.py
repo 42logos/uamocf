@@ -78,8 +78,34 @@ def get_device(x: Array) -> Optional[torch.device]:
 
 
 @dataclass
+class FeatureTypeConfig:
+    """
+    Configuration for feature types in mixed-integer optimization (MIES).
+    
+    Supports:
+    - continuous: Numerical features (SBX crossover, Gaussian/polynomial mutation)
+    - categorical: Discrete features with multiple levels (uniform crossover, uniform sampling mutation)
+    - binary: Binary features (uniform crossover, flip mutation)
+    """
+    # Feature type for each variable: 'continuous', 'categorical', or 'binary'
+    # If None, all features are treated as continuous
+    feature_types: Optional[List[str]] = None
+    
+    # For categorical features: list of admissible levels for each categorical feature
+    # Dict mapping feature index -> list of admissible values
+    categorical_levels: Optional[Dict[int, List[float]]] = None
+    
+    # Indices of non-actionable features (permanently fixed to x*)
+    fixed_features: Optional[List[int]] = None
+    
+    # Feature bounds for actionability (capping extreme values)
+    # If None, derived from problem bounds or X_obs
+    actionable_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None
+
+
+@dataclass
 class NSGAConfig:
-    """Configuration for NSGA-II optimization."""
+    """Configuration for NSGA-II optimization with MOC framework."""
     
     pop_size: int = 100
     n_gen: int = 200
@@ -106,6 +132,8 @@ class NSGAConfig:
     use_conditional_mutator: bool = True     # Conditional mutator with transformation trees
     use_modified_crowding: bool = True       # Modified crowding distance (feature + objective)
     use_penalization: bool = True            # Constraint handling via penalization
+    use_feature_reset: bool = True           # Reset features to x* after mutation (sparsity)
+    use_mies: bool = True                    # Mixed Integer Evolutionary Strategies
     
     # ICE initialization parameters
     ice_p_min: float = 0.01                  # Min probability of changing a feature
@@ -118,6 +146,12 @@ class NSGAConfig:
     # Crowding distance weighting
     cd_objective_weight: float = 0.5         # Weight for objective space crowding
     cd_feature_weight: float = 0.5           # Weight for feature space crowding
+    
+    # Feature reset parameters (sparsity enforcement)
+    feature_reset_prob: float = 0.1          # Probability of resetting each feature to x*
+    
+    # Feature type configuration for MIES
+    feature_config: Optional[FeatureTypeConfig] = None
 
 class FactualBasedSampling(FloatRandomSampling):
     """
@@ -550,6 +584,362 @@ class ConditionalMutation(Mutation):
         X_mutated = np.clip(X_mutated, problem.xl, problem.xu)
         
         return X_mutated
+
+
+# =============================================================================
+# MOC Adjustment: MIES (Mixed Integer Evolutionary Strategies)
+# =============================================================================
+
+class MIESMutation(Mutation):
+    """
+    Mixed Integer Evolutionary Strategies (MIES) Mutator.
+    
+    Handles mixed discrete and continuous search spaces:
+    - Continuous features: Scaled Gaussian mutation (similar to polynomial mutation)
+    - Categorical features: Uniform sampling from admissible levels
+    - Binary features: Flip mutation
+    
+    Based on Li et al. [19] from the MOC paper.
+    """
+    
+    def __init__(
+        self,
+        feature_types: List[str],
+        categorical_levels: Optional[Dict[int, List[float]]] = None,
+        prob: float = None,
+        eta: float = 20,
+        sigma_scale: float = 0.1,
+    ):
+        """
+        Args:
+            feature_types: List of types for each feature: 'continuous', 'categorical', 'binary'
+            categorical_levels: Dict mapping categorical feature index -> admissible values
+            prob: Mutation probability per variable
+            eta: Distribution index for continuous mutation
+            sigma_scale: Scale for Gaussian mutation (fraction of feature range)
+        """
+        super().__init__()
+        self.feature_types = feature_types
+        self.categorical_levels = categorical_levels or {}
+        self.prob = prob
+        self.eta = eta
+        self.sigma_scale = sigma_scale
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        """
+        Apply MIES mutation to population.
+        
+        Args:
+            problem: pymoo Problem
+            X: Population decision variables, shape (n_pop, n_var)
+            
+        Returns:
+            Mutated population, shape (n_pop, n_var)
+        """
+        n_pop, n_var = X.shape
+        X_mutated = X.copy()
+        
+        # Per-variable mutation probability
+        prob = self.prob if self.prob is not None else (1.0 / n_var)
+        
+        for i in range(n_pop):
+            for j in range(n_var):
+                if np.random.random() < prob:
+                    ftype = self.feature_types[j] if j < len(self.feature_types) else 'continuous'
+                    
+                    if ftype == 'continuous':
+                        # Scaled Gaussian mutation
+                        sigma = (problem.xu[j] - problem.xl[j]) * self.sigma_scale
+                        X_mutated[i, j] += np.random.normal(0, sigma)
+                        
+                    elif ftype == 'categorical':
+                        # Uniform sampling from admissible levels
+                        if j in self.categorical_levels:
+                            X_mutated[i, j] = np.random.choice(self.categorical_levels[j])
+                        else:
+                            # Fallback: sample uniformly from bounds
+                            X_mutated[i, j] = np.random.uniform(problem.xl[j], problem.xu[j])
+                            
+                    elif ftype == 'binary':
+                        # Flip mutation
+                        X_mutated[i, j] = 1.0 - X_mutated[i, j]
+        
+        # Clip continuous features to bounds
+        for j in range(n_var):
+            ftype = self.feature_types[j] if j < len(self.feature_types) else 'continuous'
+            if ftype == 'continuous':
+                X_mutated[:, j] = np.clip(X_mutated[:, j], problem.xl[j], problem.xu[j])
+            elif ftype == 'binary':
+                X_mutated[:, j] = np.clip(X_mutated[:, j], 0, 1)
+        
+        return X_mutated
+
+
+class MIESConditionalMutation(Mutation):
+    """
+    Combined MIES + Conditional Mutation.
+    
+    Uses transformation trees for conditional sampling when available,
+    with MIES-style mutations as fallback based on feature types.
+    """
+    
+    def __init__(
+        self,
+        feature_types: List[str],
+        transformation_trees: Optional[TransformationTreeMutator] = None,
+        categorical_levels: Optional[Dict[int, List[float]]] = None,
+        prob: float = None,
+        use_conditional_prob: float = 0.7,
+        sigma_scale: float = 0.1,
+    ):
+        super().__init__()
+        self.feature_types = feature_types
+        self.trees = transformation_trees
+        self.categorical_levels = categorical_levels or {}
+        self.prob = prob
+        self.use_conditional_prob = use_conditional_prob
+        self.sigma_scale = sigma_scale
+    
+    def _do(self, problem, X, **kwargs) -> np.ndarray:
+        n_pop, n_var = X.shape
+        X_mutated = X.copy()
+        prob = self.prob if self.prob is not None else (1.0 / n_var)
+        
+        for i in range(n_pop):
+            # Randomize feature order for conditional mutation
+            feature_order = np.random.permutation(n_var)
+            
+            for j in feature_order:
+                if np.random.random() < prob:
+                    ftype = self.feature_types[j] if j < len(self.feature_types) else 'continuous'
+                    
+                    # Try conditional mutation first
+                    if self.trees is not None and np.random.random() < self.use_conditional_prob:
+                        new_value = self.trees.sample_conditional(X_mutated[i], j)
+                        X_mutated[i, j] = new_value
+                    else:
+                        # MIES mutation based on feature type
+                        if ftype == 'continuous':
+                            sigma = (problem.xu[j] - problem.xl[j]) * self.sigma_scale
+                            X_mutated[i, j] += np.random.normal(0, sigma)
+                        elif ftype == 'categorical':
+                            if j in self.categorical_levels:
+                                X_mutated[i, j] = np.random.choice(self.categorical_levels[j])
+                            else:
+                                X_mutated[i, j] = np.random.uniform(problem.xl[j], problem.xu[j])
+                        elif ftype == 'binary':
+                            X_mutated[i, j] = 1.0 - X_mutated[i, j]
+        
+        # Clip to bounds
+        for j in range(n_var):
+            ftype = self.feature_types[j] if j < len(self.feature_types) else 'continuous'
+            if ftype == 'continuous':
+                X_mutated[:, j] = np.clip(X_mutated[:, j], problem.xl[j], problem.xu[j])
+            elif ftype == 'binary':
+                X_mutated[:, j] = np.clip(X_mutated[:, j], 0, 1)
+        
+        return X_mutated
+
+
+# =============================================================================
+# MOC Adjustment: Feature Reset to x* (Sparsity Enforcement)
+# =============================================================================
+
+class FeatureResetOperator:
+    """
+    Post-mutation operator that resets features to x* with low probability.
+    
+    From MOC paper: "After recombination and mutation, some feature values are 
+    randomly set to the values of x* with a given (low) probability—another 
+    control parameter—to prevent all features from deviating from x*."
+    
+    This encourages sparsity in counterfactual explanations.
+    """
+    
+    def __init__(
+        self,
+        x_star: np.ndarray,
+        reset_prob: float = 0.1,
+        fixed_features: Optional[List[int]] = None,
+    ):
+        """
+        Args:
+            x_star: Factual instance values, shape (d,)
+            reset_prob: Probability of resetting each feature to x*
+            fixed_features: Indices of features always fixed to x* (non-actionable)
+        """
+        self.x_star = np.asarray(x_star).flatten()
+        self.reset_prob = reset_prob
+        self.fixed_features = set(fixed_features) if fixed_features else set()
+    
+    def __call__(self, X: np.ndarray) -> np.ndarray:
+        """
+        Apply feature reset to population.
+        
+        Args:
+            X: Population, shape (n_pop, n_var)
+            
+        Returns:
+            Population with some features reset to x*
+        """
+        n_pop, n_var = X.shape
+        X_reset = X.copy()
+        
+        for i in range(n_pop):
+            for j in range(n_var):
+                # Always reset non-actionable features
+                if j in self.fixed_features:
+                    X_reset[i, j] = self.x_star[j]
+                # Randomly reset other features with low probability
+                elif np.random.random() < self.reset_prob:
+                    X_reset[i, j] = self.x_star[j]
+        
+        return X_reset
+
+
+class ActionabilityEnforcer:
+    """
+    Enforces actionability constraints on candidates.
+    
+    From MOC paper:
+    1. Caps extreme values to predefined bounds
+    2. Permanently fixes non-actionable features to x*
+    """
+    
+    def __init__(
+        self,
+        x_star: np.ndarray,
+        fixed_features: Optional[List[int]] = None,
+        actionable_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    ):
+        """
+        Args:
+            x_star: Factual instance values, shape (d,)
+            fixed_features: Indices of non-actionable features
+            actionable_bounds: (lower, upper) bounds for capping, each shape (d,)
+        """
+        self.x_star = np.asarray(x_star).flatten()
+        self.fixed_features = set(fixed_features) if fixed_features else set()
+        self.actionable_bounds = actionable_bounds
+    
+    def __call__(self, X: np.ndarray) -> np.ndarray:
+        """
+        Enforce actionability on population.
+        
+        Args:
+            X: Population, shape (n_pop, n_var)
+            
+        Returns:
+            Population with actionability enforced
+        """
+        n_pop, n_var = X.shape
+        X_enforced = X.copy()
+        
+        # Fix non-actionable features
+        for j in self.fixed_features:
+            if j < n_var:
+                X_enforced[:, j] = self.x_star[j]
+        
+        # Cap to actionable bounds
+        if self.actionable_bounds is not None:
+            lower, upper = self.actionable_bounds
+            X_enforced = np.clip(X_enforced, lower, upper)
+        
+        return X_enforced
+
+
+# =============================================================================
+# MOC Adjustment: MIES Crossover (Mixed Types)
+# =============================================================================
+
+from pymoo.core.crossover import Crossover
+
+
+class MIESCrossover(Crossover):
+    """
+    Mixed Integer Evolutionary Strategies Crossover.
+    
+    From MOC paper:
+    - Numerical features: Simulated Binary Crossover (SBX)
+    - Categorical/Binary features: Uniform Crossover
+    """
+    
+    def __init__(
+        self,
+        feature_types: List[str],
+        prob: float = 0.9,
+        eta: float = 15,
+    ):
+        """
+        Args:
+            feature_types: List of types for each feature
+            prob: Crossover probability
+            eta: Distribution index for SBX
+        """
+        # n_parents=2, n_offsprings=2
+        super().__init__(n_parents=2, n_offsprings=2)
+        self.feature_types = feature_types
+        self.prob = prob
+        self.eta = eta
+    
+    def _do(self, problem, X, **kwargs):
+        """
+        Apply MIES crossover.
+        
+        Args:
+            problem: pymoo Problem
+            X: Parents, shape (n_parents=2, n_matings, n_var)
+            
+        Returns:
+            Offspring, shape (n_offsprings=2, n_matings, n_var)
+        """
+        n_parents, n_matings, n_var = X.shape
+        # Output shape must be (n_offsprings, n_matings, n_var)
+        Y = np.full((2, n_matings, n_var), np.nan)
+        
+        for k in range(n_matings):
+            p1, p2 = X[0, k], X[1, k]  # Parents indexed as (parent_idx, mating_idx, var)
+            c1, c2 = p1.copy(), p2.copy()
+            
+            if np.random.random() < self.prob:
+                for j in range(n_var):
+                    ftype = self.feature_types[j] if j < len(self.feature_types) else 'continuous'
+                    
+                    if ftype == 'continuous':
+                        # SBX crossover for continuous features
+                        if np.random.random() < 0.5:
+                            if abs(p1[j] - p2[j]) > 1e-10:
+                                c1[j], c2[j] = self._sbx_single(
+                                    p1[j], p2[j], 
+                                    problem.xl[j], problem.xu[j], 
+                                    self.eta
+                                )
+                    else:
+                        # Uniform crossover for categorical/binary
+                        if np.random.random() < 0.5:
+                            c1[j], c2[j] = p2[j], p1[j]
+            
+            Y[0, k] = c1
+            Y[1, k] = c2
+        
+        return Y
+    
+    def _sbx_single(self, p1: float, p2: float, xl: float, xu: float, eta: float) -> Tuple[float, float]:
+        """SBX for a single continuous variable."""
+        u = np.random.random()
+        
+        if u <= 0.5:
+            beta = (2 * u) ** (1.0 / (eta + 1))
+        else:
+            beta = (1.0 / (2 * (1 - u))) ** (1.0 / (eta + 1))
+        
+        c1 = 0.5 * ((p1 + p2) - beta * abs(p2 - p1))
+        c2 = 0.5 * ((p1 + p2) + beta * abs(p2 - p1))
+        
+        c1 = np.clip(c1, xl, xu)
+        c2 = np.clip(c2, xl, xu)
+        
+        return c1, c2
 
 
 # =============================================================================
@@ -1378,6 +1768,101 @@ def run_nsga(
     return result
 
 
+class MOCCallback(Callback):
+    """
+    Extended callback for MOC that applies feature reset and actionability
+    enforcement after each generation.
+    """
+    
+    def __init__(
+        self,
+        validity_threshold: float = 0.5,
+        print_every: int = 10,
+        verbose: bool = True,
+        feature_reset_op: Optional[FeatureResetOperator] = None,
+        actionability_enforcer: Optional[ActionabilityEnforcer] = None,
+    ):
+        super().__init__()
+        self.validity_threshold = validity_threshold
+        self.print_every = print_every
+        self.verbose = verbose
+        self.feature_reset_op = feature_reset_op
+        self.actionability_enforcer = actionability_enforcer
+        self.history: List[ProgressEntry] = []
+    
+    def notify(self, algorithm):
+        """Called each generation - apply post-mutation operators and track progress."""
+        gen = algorithm.n_gen
+        
+        # Apply feature reset and actionability enforcement to population
+        if self.feature_reset_op is not None or self.actionability_enforcer is not None:
+            X = algorithm.pop.get("X")
+            if X is not None:
+                if self.feature_reset_op is not None:
+                    X = self.feature_reset_op(X)
+                if self.actionability_enforcer is not None:
+                    X = self.actionability_enforcer(X)
+                algorithm.pop.set("X", X)
+        
+        # Track progress (same as ValidCFCallback)
+        F = algorithm.pop.get("F")
+        if F is None:
+            return
+        
+        if F.ndim == 1:
+            F = F.reshape(1, -1)
+        if F.size == 0 or F.shape[0] == 0:
+            return
+        
+        n_valid_pop = int(np.sum(F[:, 0] < self.validity_threshold))
+        
+        n_valid_archive = 0
+        mean_sparsity = 0.0
+        if algorithm.opt is not None:
+            F_opt = algorithm.opt.get("F")
+            if F_opt is not None and F_opt.size > 0:
+                if F_opt.ndim == 1:
+                    F_opt = F_opt.reshape(1, -1)
+                if F_opt.shape[1] > 0:
+                    n_valid_archive = int(np.sum(F_opt[:, 0] < self.validity_threshold))
+                    mean_sparsity = float(F_opt[:, 1].mean()) if F_opt.shape[1] > 1 else 0.0
+        
+        best_validity = float(F[:, 0].min())
+        best_p_target = 1.0 - best_validity
+        
+        entry = ProgressEntry(
+            gen=gen,
+            n_valid_pop=n_valid_pop,
+            n_valid_archive=n_valid_archive,
+            best_validity=best_validity,
+            best_p_target=best_p_target,
+            mean_sparsity=mean_sparsity,
+        )
+        self.history.append(entry)
+        
+        if self.verbose and (gen % self.print_every == 0 or gen == 1):
+            print(
+                f"Gen {gen:4d} | "
+                f"Valid CFs (pop): {n_valid_pop:3d} | "
+                f"Valid CFs (archive): {n_valid_archive:3d} | "
+                f"Best P(target): {best_p_target:.3f} | "
+                f"Mean Sparsity: {mean_sparsity:.3f}"
+            )
+    
+    def get_summary(self) -> Dict:
+        """Get summary of optimization progress."""
+        if not self.history:
+            return {}
+        return {
+            "total_generations": len(self.history),
+            "final_valid_pop": self.history[-1].n_valid_pop,
+            "final_valid_archive": self.history[-1].n_valid_archive,
+            "best_p_target": self.history[-1].best_p_target,
+            "final_mean_sparsity": self.history[-1].mean_sparsity,
+            "history": self.history,
+        }
+
+
 def run_moc_nsga(
     problem: Problem,
     config: NSGAConfig,
@@ -1387,17 +1872,20 @@ def run_moc_nsga(
     device: Optional[torch.device] = None,
 ) -> Result:
     """
-    Run NSGA-II with MOC (Multi-Objective Counterfactuals) framework adjustments.
+    Run NSGA-II with full MOC (Multi-Objective Counterfactuals) framework.
     
-    Implements all four key MOC modifications:
-    1. ICE Curve Variance Initialization - biases initial population
-    2. Conditional Mutator with Transformation Trees - plausible mutations
-    3. Modified Crowding Distance - diversity in feature + objective space
-    4. Penalization - constraint handling for validity
+    Implements all MOC modifications from Dandl et al.:
+    1. ICE Curve Variance Initialization - biases initial population towards influential features
+    2. MIES (Mixed Integer Evolutionary Strategies) - handles mixed discrete/continuous features
+    3. Conditional Mutator with Transformation Trees - plausible on-manifold mutations
+    4. Feature Reset to x* - enforces sparsity by resetting features with low probability
+    5. Modified Crowding Distance - diversity in feature + objective space (Gower + L1)
+    6. Penalization - constraint handling for validity via front reassignment
+    7. Actionability - caps extreme values and fixes non-actionable features
     
     Args:
         problem: pymoo Problem for counterfactual optimization
-        config: NSGAConfig with MOC parameters
+        config: NSGAConfig with MOC parameters (including feature_config for MIES)
         x_star: Factual instance, shape (d,) - can be tensor or numpy
         X_obs: Observed data, shape (N, d) - can be tensor or numpy
         model: Model for ICE curve computation (required if use_ice_initialization=True)
@@ -1406,22 +1894,28 @@ def run_moc_nsga(
     Returns:
         pymoo Result object
     """
-    # Store original tensor versions if needed for model calls
-    x_star_tensor = to_tensor(x_star, device=device) if device else None
-    X_obs_tensor = to_tensor(X_obs, device=device) if device else None
-    
     # Convert to numpy for pymoo (optimization operates on numpy)
     x_star_np = to_numpy(x_star).flatten()
     X_obs_np = to_numpy(X_obs).reshape(-1, x_star_np.shape[0])
+    n_var = problem.n_var
+    
+    # Get feature configuration
+    feature_config = config.feature_config or FeatureTypeConfig()
+    feature_types = feature_config.feature_types or ['continuous'] * n_var
+    fixed_features = feature_config.fixed_features or []
+    
+    if config.verbose:
+        print("=" * 60)
+        print("[MOC] Multi-Objective Counterfactual Framework")
+        print("=" * 60)
     
     # ==========================================================================
     # MOC Adjustment 1: ICE Curve Variance Initialization
     # ==========================================================================
     if config.use_ice_initialization and model is not None:
-        # ICEVarianceSampling handles tensor conversion internally
         sampling = ICEVarianceSampling(
-            x_star=x_star,  # Pass original (may be tensor)
-            X_obs=X_obs,    # Pass original (may be tensor)
+            x_star=x_star,
+            X_obs=X_obs,
             model=model,
             p_min=config.ice_p_min,
             p_max=config.ice_p_max,
@@ -1433,34 +1927,107 @@ def run_moc_nsga(
             print(f"      Feature change probabilities: min={sampling.p_change.min():.3f}, "
                   f"max={sampling.p_change.max():.3f}, mean={sampling.p_change.mean():.3f}")
     else:
-        # Fallback to factual-based sampling
         sampling = FactualBasedSampling(x_star=x_star_np, noise_scale=0.2)
         if config.verbose:
             print(f"[MOC] Using Factual-Based Sampling (ICE disabled or no model)")
     
     # ==========================================================================
-    # MOC Adjustment 2: Conditional Mutator with Transformation Trees
+    # MOC Adjustment 2: MIES Crossover (Mixed Types)
     # ==========================================================================
-    mutation_prob = config.mutation_prob if config.mutation_prob is not None else (1.0 / problem.n_var)
-    
-    if config.use_conditional_mutator:
-        # Train transformation trees on observed data (handles tensor internally)
-        transformation_trees = TransformationTreeMutator(X_obs)
-        mutation = ConditionalMutation(
-            transformation_trees=transformation_trees,
-            prob=mutation_prob,
-            eta=config.mutation_eta,
-            use_conditional_prob=0.7,  # 70% conditional, 30% standard
+    if config.use_mies and any(ft != 'continuous' for ft in feature_types):
+        crossover = MIESCrossover(
+            feature_types=feature_types,
+            prob=config.crossover_prob,
+            eta=config.crossover_eta,
         )
         if config.verbose:
-            print(f"[MOC] Conditional Mutator enabled (70% conditional, 30% polynomial)")
+            n_cont = sum(1 for ft in feature_types if ft == 'continuous')
+            n_cat = sum(1 for ft in feature_types if ft == 'categorical')
+            n_bin = sum(1 for ft in feature_types if ft == 'binary')
+            print(f"[MOC] MIES Crossover enabled")
+            print(f"      Features: {n_cont} continuous, {n_cat} categorical, {n_bin} binary")
+    else:
+        crossover = SBX(prob=config.crossover_prob, eta=int(config.crossover_eta))
+        if config.verbose:
+            print(f"[MOC] Using SBX Crossover (all continuous features)")
+    
+    # ==========================================================================
+    # MOC Adjustment 3: Conditional Mutator with MIES support
+    # ==========================================================================
+    mutation_prob = config.mutation_prob if config.mutation_prob is not None else (1.0 / n_var)
+    
+    if config.use_conditional_mutator:
+        transformation_trees = TransformationTreeMutator(X_obs_np)
+        
+        if config.use_mies and any(ft != 'continuous' for ft in feature_types):
+            # Combined MIES + Conditional mutation
+            mutation = MIESConditionalMutation(
+                feature_types=feature_types,
+                transformation_trees=transformation_trees,
+                categorical_levels=feature_config.categorical_levels,
+                prob=mutation_prob,
+                use_conditional_prob=0.7,
+            )
+            if config.verbose:
+                print(f"[MOC] MIES + Conditional Mutator enabled (70% conditional)")
+        else:
+            mutation = ConditionalMutation(
+                transformation_trees=transformation_trees,
+                prob=mutation_prob,
+                eta=config.mutation_eta,
+                use_conditional_prob=0.7,
+            )
+            if config.verbose:
+                print(f"[MOC] Conditional Mutator enabled (70% conditional, 30% polynomial)")
+    elif config.use_mies and any(ft != 'continuous' for ft in feature_types):
+        mutation = MIESMutation(
+            feature_types=feature_types,
+            categorical_levels=feature_config.categorical_levels,
+            prob=mutation_prob,
+        )
+        if config.verbose:
+            print(f"[MOC] MIES Mutator enabled (no conditional)")
     else:
         mutation = PM(prob=mutation_prob, eta=int(config.mutation_eta))
         if config.verbose:
             print(f"[MOC] Using standard Polynomial Mutation")
     
     # ==========================================================================
-    # MOC Adjustment 3 & 4: Modified Crowding Distance + Penalization
+    # MOC Adjustment 4: Feature Reset to x* (Sparsity Enforcement)
+    # ==========================================================================
+    feature_reset_op = None
+    if config.use_feature_reset:
+        feature_reset_op = FeatureResetOperator(
+            x_star=x_star_np,
+            reset_prob=config.feature_reset_prob,
+            fixed_features=fixed_features,
+        )
+        if config.verbose:
+            print(f"[MOC] Feature Reset enabled (prob={config.feature_reset_prob:.2f})")
+            if fixed_features:
+                print(f"      Non-actionable features: {fixed_features}")
+    
+    # ==========================================================================
+    # MOC Adjustment 5: Actionability Enforcement
+    # ==========================================================================
+    actionability_enforcer = None
+    if fixed_features or feature_config.actionable_bounds is not None:
+        # Derive actionable bounds from X_obs if not specified
+        actionable_bounds = feature_config.actionable_bounds
+        if actionable_bounds is None:
+            actionable_bounds = (X_obs_np.min(axis=0), X_obs_np.max(axis=0))
+        
+        actionability_enforcer = ActionabilityEnforcer(
+            x_star=x_star_np,
+            fixed_features=fixed_features,
+            actionable_bounds=actionable_bounds,
+        )
+        if config.verbose:
+            print(f"[MOC] Actionability Enforcer enabled")
+            print(f"      Bounds derived from observed data range")
+    
+    # ==========================================================================
+    # MOC Adjustment 6 & 7: Modified Crowding Distance + Penalization
     # ==========================================================================
     if config.use_modified_crowding or config.use_penalization:
         survival = PenalizedRankAndCrowdingSurvival(
@@ -1468,7 +2035,6 @@ def run_moc_nsga(
             weight_obj=config.cd_objective_weight,
             weight_feature=config.cd_feature_weight,
         )
-        # Set feature range for Gower distance
         feature_range = problem.xu - problem.xl
         feature_range[feature_range == 0] = 1.0
         survival.set_feature_range(feature_range)
@@ -1485,12 +2051,12 @@ def run_moc_nsga(
             print(f"[MOC] Using standard Rank and Crowding Survival")
     
     # ==========================================================================
-    # Create NSGA-II Algorithm with MOC Components
+    # Create NSGA-II Algorithm with Full MOC Components
     # ==========================================================================
     algorithm = NSGA2(
         pop_size=config.pop_size,
         sampling=sampling,
-        crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
+        crossover=crossover,
         mutation=mutation,
         survival=survival,
         eliminate_duplicates=True,
@@ -1507,17 +2073,19 @@ def run_moc_nsga(
     else:
         termination = get_termination("n_gen", config.n_gen)
     
-    # Setup callback
-    callback = ValidCFCallback(
+    # Setup MOC callback with feature reset and actionability
+    callback = MOCCallback(
         validity_threshold=config.validity_threshold,
         print_every=10,
         verbose=config.verbose,
+        feature_reset_op=feature_reset_op,
+        actionability_enforcer=actionability_enforcer,
     )
     
     if config.verbose:
         print(f"\n[MOC] Starting NSGA-II optimization...")
         print(f"      Population: {config.pop_size}, Max generations: {config.max_gen}")
-        print(f"      Features: {problem.n_var}, Objectives: {problem.n_obj}")
+        print(f"      Features: {n_var}, Objectives: {problem.n_obj}")
         print("-" * 60)
     
     # Run optimization
