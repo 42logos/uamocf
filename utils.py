@@ -495,13 +495,15 @@ def plot_cf_3d(
     valided_F_mmo = np.array(valided_F_mmo)
     not_valided_F_mmo = np.array(not_valided_F_mmo)
 
-    fig.add_trace(go.Scatter3d(
-        x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=-not_valided_F_mmo[:,3],  # -(-AU) = AU
-        mode='markers',
-        marker=dict(color='blue', size=
-                    5, opacity=1,symbol='cross'),
-        name='Pareto Front which not valid'
-    ))
+    # Only add invalid counterfactuals trace if there are any
+    if len(not_valided_F_mmo) > 0:
+        fig.add_trace(go.Scatter3d(
+            x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=-not_valided_F_mmo[:,3],  # -(-AU) = AU
+            mode='markers',
+            marker=dict(color='blue', size=
+                        5, opacity=1,symbol='cross'),
+            name='Pareto Front which not valid'
+        ))
 
     fig.add_trace(go.Scatter3d(
         x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=-valided_F_mmo[:,3],  # -(-AU) = AU
