@@ -604,36 +604,51 @@ def compute_moc_crowding_distance(X: np.ndarray,
 
 class MOCRankAndCrowdingSurvival(Survival):
     """
-    Survival operator using MOC-style modified crowding distance.
+    Survival operator using MOC-style modified crowding distance with constraint handling.
     
-    Implements the Avila et al. approach where crowding distance
-    combines both objective space (L1) and feature space (Gower) distances.
-    This promotes diversity in both objectives and actionable feature changes.
+    Implements the Avila et al. approach where:
+    1. Crowding distance combines both objective space (L1) and feature space (Gower) distances
+    2. Constraint handling demotes invalid candidates to worst fronts
+    
+    Constraint Handling (based on Dandl et al. / Deb et al.):
+    - Validity constraint: v(x) = max(0, o1(x) - epsilon)
+    - If v(x) = 0: feasible (prediction close enough to target)
+    - If v(x) > 0: constraint violation (demoted to worst fronts)
+    - Violators are sorted by violation amount and placed in individual fronts
+      after all feasible fronts, ensuring feasible solutions always survive first.
     """
     
     def __init__(self, 
                  feature_ranges: np.ndarray,
                  feature_types: Optional[np.ndarray] = None,
                  alpha: float = 0.5,
-                 nds: Optional[NonDominatedSorting] = None):
+                 nds: Optional[NonDominatedSorting] = None,
+                 use_constraint_handling: bool = False,
+                 validity_eps: float = 0.0,
+                 validity_obj_idx: int = 0):
         """
         Args:
             feature_ranges: Range of each feature (max - min) for Gower distance
             feature_types: Array of 'numerical' or 'categorical' for each feature
             alpha: Weight for objective space distance (0.5 = equal weighting)
             nds: Non-dominated sorting instance
-
-        Returns:
-            
+            use_constraint_handling: Whether to apply validity constraint handling
+            validity_eps: Tolerance epsilon for validity constraint.
+                          v(x) = max(0, o1(x) - epsilon)
+                          If epsilon=0, any o1 > 0 is a violation.
+            validity_obj_idx: Index of validity objective in F (default: 0)
         """
         super().__init__(filter_infeasible=True)
         self.feature_ranges = feature_ranges
         self.feature_types = feature_types
         self.alpha = alpha
         self.nds = nds if nds is not None else NonDominatedSorting()
+        self.use_constraint_handling = use_constraint_handling
+        self.validity_eps = validity_eps
+        self.validity_obj_idx = validity_obj_idx
     
     def _do(self, problem, pop, *args, n_survive=None, **kwargs):
-        """Perform survival selection with MOC crowding distance."""
+        """Perform survival selection with MOC crowding distance and constraint handling."""
         
         if n_survive is None:
             n_survive = len(pop)
@@ -642,37 +657,67 @@ class MOCRankAndCrowdingSurvival(Survival):
         F = pop.get("F").astype(float, copy=False)
         X = pop.get("X").astype(float, copy=False)
         
-        # Non-dominated sorting
+        # =====================================================================
+        # Step 1: Standard non-dominated sorting (ignoring constraints)
+        # =====================================================================
         fronts = self.nds.do(F, n_stop_if_ranked=n_survive)
         
-        # Initialize crowding distance for all individuals
+        # Initialize arrays for all individuals
         crowding = np.full(len(pop), np.nan)
-        
-        # Assign ranks
         ranks = np.full(len(pop), -1)
+        violations = np.zeros(len(pop))  # Store violation amounts
         
+        # =====================================================================
+        # Step 2: Identify constraint violators (if constraint handling enabled)
+        # v(x) = max(0, o1(x) - epsilon)
+        # =====================================================================
+        if self.use_constraint_handling:
+            validity_obj = F[:, self.validity_obj_idx]
+            violations = np.maximum(0.0, validity_obj - self.validity_eps)
+            violator_mask = violations > 0
+            violator_indices = np.where(violator_mask)[0]
+            feasible_mask = ~violator_mask
+        else:
+            violator_indices = np.array([], dtype=int)
+            feasible_mask = np.ones(len(pop), dtype=bool)
+        
+        # =====================================================================
+        # Step 3: Process feasible fronts (remove violators from fronts)
+        # =====================================================================
+        feasible_fronts = []
+        for front in fronts:
+            front_arr = np.array(front)
+            # Remove violators from this front
+            feasible_in_front = front_arr[feasible_mask[front_arr]]
+            if len(feasible_in_front) > 0:
+                feasible_fronts.append(feasible_in_front)
+        
+        # =====================================================================
+        # Step 4: Compute crowding distance and select survivors from feasible fronts
+        # =====================================================================
         survivors = []
+        current_rank = 0
         
-        for k, front in enumerate(fronts):
-            # Get individuals in this front
-            I = np.array(front)
+        for front in feasible_fronts:
+            I = front
             
-            # Assign rank
-            ranks[I] = k
+            # Assign rank to feasible individuals
+            ranks[I] = current_rank
             
             # Compute MOC crowding distance for this front
-            F_front = F[I]
-            X_front = X[I]
-            
-            cd = compute_moc_crowding_distance(
-                X_front, F_front, 
-                self.feature_ranges,
-                self.feature_types,
-                self.alpha
-            )
-            
-            # Store crowding distance for individuals in this front
-            crowding[I] = cd
+            if len(I) > 0:
+                F_front = F[I]
+                X_front = X[I]
+                
+                cd = compute_moc_crowding_distance(
+                    X_front, F_front, 
+                    self.feature_ranges,
+                    self.feature_types,
+                    self.alpha
+                )
+                
+                # Store crowding distance
+                crowding[I] = cd
             
             # Check if adding this front exceeds capacity
             if len(survivors) + len(I) <= n_survive:
@@ -689,10 +734,34 @@ class MOCRankAndCrowdingSurvival(Survival):
                     survivors.extend(selected.tolist())
                 
                 break
+            
+            current_rank += 1
+        
+        # =====================================================================
+        # Step 5: If still need more survivors, add violators sorted by violation
+        # Each violator gets its own front (F_{K+1}, F_{K+2}, ...)
+        # Sorted ascending by violation: smallest violation = best among violators
+        # =====================================================================
+        if len(survivors) < n_survive and len(violator_indices) > 0:
+            # Sort violators by violation amount (ascending)
+            violator_violations = violations[violator_indices]
+            sorted_violator_order = np.argsort(violator_violations)
+            sorted_violators = violator_indices[sorted_violator_order]
+            
+            # Assign each violator to its own "virtual" front after feasible fronts
+            # The violator with smallest violation gets rank K+1, next gets K+2, etc.
+            for i, violator_idx in enumerate(sorted_violators):
+                ranks[violator_idx] = current_rank + i + 1
+                # Crowding distance is irrelevant for singleton fronts, set to 0
+                crowding[violator_idx] = 0.0
+                
+                if len(survivors) < n_survive:
+                    survivors.append(violator_idx)
         
         # Set attributes on population before subsetting
         pop.set("crowding", crowding)
         pop.set("rank", ranks)
+        pop.set("violation", violations)  # Store violations for debugging/analysis
         
         # Return survivors - crowding values are preserved
         return pop[survivors]
@@ -700,34 +769,51 @@ class MOCRankAndCrowdingSurvival(Survival):
 
 class MOCNSGA2(NSGA2):
     """
-    NSGA-II with MOC-style modified crowding distance.
+    NSGA-II with MOC-style modified crowding distance and constraint handling.
     
     This variant uses a combined crowding distance that considers both:
     1. Objective space diversity (L1 norm between objectives)
     2. Feature space diversity (Gower distance between decision variables)
     
-    This approach, based on Avila et al., is particularly suited for
+    Constraint Handling (Dandl et al. / Deb et al.):
+    - Validity constraint based on objective o1 and tolerance epsilon
+    - v(x) = max(0, o1(x) - epsilon)
+    - Feasible solutions (v=0) are always preferred over violators
+    - Violators are demoted to worst fronts, sorted by violation amount
+    
+    This approach, based on Avila et al. and Dandl et al., is particularly suited for
     counterfactual generation where we want diverse feature changes,
-    not just diverse objective trade-offs.
+    not just diverse objective trade-offs, while ensuring validity.
     """
     
     def __init__(self,
                  feature_ranges: np.ndarray,
                  feature_types: Optional[np.ndarray] = None,
                  crowding_alpha: float = 0.5,
+                 use_constraint_handling: bool = False,
+                 validity_eps: float = 0.0,
+                 validity_obj_idx: int = 0,
                  **kwargs):
         """
         Args:
             feature_ranges: Range of each feature (xu - xl) for Gower normalization
             feature_types: Feature type indicators ('numerical'/'categorical')
             crowding_alpha: Weight for objective space (0.5 = equal weighting)
+            use_constraint_handling: Enable validity constraint handling
+            validity_eps: Tolerance epsilon for validity constraint.
+                          v(x) = max(0, o1(x) - epsilon)
+                          Default 0.0 means any prediction outside Y0 is a violation.
+            validity_obj_idx: Index of validity objective in F (default: 0)
             **kwargs: Additional NSGA2 arguments
         """
-        # Create custom survival operator
+        # Create custom survival operator with constraint handling
         survival = MOCRankAndCrowdingSurvival(
             feature_ranges=feature_ranges,
             feature_types=feature_types,
-            alpha=crowding_alpha
+            alpha=crowding_alpha,
+            use_constraint_handling=use_constraint_handling,
+            validity_eps=validity_eps,
+            validity_obj_idx=validity_obj_idx
         )
         
         # Initialize parent NSGA2 with custom survival
@@ -736,6 +822,9 @@ class MOCNSGA2(NSGA2):
         self.feature_ranges = feature_ranges
         self.feature_types = feature_types
         self.crowding_alpha = crowding_alpha
+        self.use_constraint_handling = use_constraint_handling
+        self.validity_eps = validity_eps
+        self.validity_obj_idx = validity_obj_idx
 
 
 @dataclass
@@ -766,6 +855,15 @@ class NSGAConfig:
     use_moc_crowding: bool = True  # Use MOC modified crowding distance
     crowding_alpha: float = 0.5   # Weight for objective space (0.5 = equal weighting)
     feature_types: Optional[np.ndarray] = None  # 'numerical' or 'categorical' per feature
+    
+    # Constraint handling parameters (Dandl et al. / Deb et al.)
+    # Penalizes candidates whose validity objective o1 exceeds tolerance epsilon
+    # v(x) = max(0, o1(x) - epsilon); violators are demoted to worst fronts
+    use_constraint_handling: bool = False  # Enable validity constraint handling
+    validity_eps: float = 0.0  # Tolerance epsilon for validity constraint
+                               # If epsilon=0, any o1 > 0 (prediction not in Y0) is a violation
+                               # If epsilon=0.1, predictions within 0.1 of Y0 are still feasible
+    validity_obj_idx: int = 0  # Index of validity objective in F (default: 0 = first objective)
     
     # Conditional Mutator parameters (MOC-style)
     use_conditional_mutator: bool = True  # Use conditional mutator for plausible mutations
@@ -1267,12 +1365,15 @@ def run_nsga(
     eliminate_duplicates = problem.n_var < 500  # Only use for low-dimensional problems
     
     if config.use_moc_crowding:
-        # Use MOC-style NSGA-II with modified crowding distance
+        # Use MOC-style NSGA-II with modified crowding distance and optional constraint handling
         algorithm = MOCNSGA2(
             pop_size=config.pop_size,
             feature_ranges=feature_ranges,
             feature_types=config.feature_types,
             crowding_alpha=config.crowding_alpha,
+            use_constraint_handling=config.use_constraint_handling,
+            validity_eps=config.validity_eps,
+            validity_obj_idx=config.validity_obj_idx,
             sampling=sampling or FloatRandomSampling(),
             crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
             mutation=mutation,
