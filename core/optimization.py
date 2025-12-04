@@ -241,7 +241,7 @@ class ConditionalMutator(Mutation):
 
 class ResetOperator(Mutation):
     """
-    MOC-style Reset Operator for counterfactual generation.
+    Reset Operator for counterfactual generation base on paper MOC.
     
     After recombination and mutation, this operator randomly resets some feature
     values back to the factual instance x* with a given probability p_reset.
@@ -345,6 +345,8 @@ class HybridMutator(Mutation):
     
     def _do(self, problem, X, **kwargs) -> np.ndarray:
         """Apply hybrid mutation."""
+        
+        # TODO use batch processing on GPU for efficiency, implement ideal: using mask
         n_offspring = X.shape[0]
         X_mutated = X.copy()
         

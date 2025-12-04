@@ -1,11 +1,27 @@
 import pickle
 import io
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Tuple, List, Any, Union
 import numpy as np
 import torch
 from torch import nn
 from core.models import SimpleNN
+
+
+def _to_numpy(arr) -> Optional[np.ndarray]:
+    """Safely convert tensor or array to numpy for serialization.
+    
+    Args:
+        arr: Input array (numpy, torch tensor, or None)
+        
+    Returns:
+        Numpy array, or None if input was None
+    """
+    if arr is None:
+        return None
+    if isinstance(arr, torch.Tensor):
+        return arr.detach().cpu().numpy()
+    return np.asarray(arr)
 
 
 @dataclass
@@ -30,29 +46,35 @@ def export_state(data, models, cf_results, F_obs, F_star=None, x_star=None):
     """
     Serializes the application state into a bytes object.
     
+    All tensor data is converted to numpy for Streamlit compatibility.
+    
     Args:
-        data: Tuple of (X, Y, p1) arrays
+        data: Tuple of (X, Y, p1) arrays (can be tensors)
         models: List of trained PyTorch models
         cf_results: Counterfactual optimization results with X and F attributes
         F_obs: Objective values for observed data points
         F_star: Objective values for the factual point x*
         x_star: The factual point coordinates (x1, x2)
     """
-    # Extract X and F from cf_results if it exists
+    # Convert data tuple to numpy
+    if data is not None:
+        data = tuple(_to_numpy(d) for d in data)
+    
+    # Extract X and F from cf_results if it exists, convert to numpy
     cf_data = None
     if cf_results is not None:
         cf_data = {
-            "X": cf_results.X,
-            "F": cf_results.F
+            "X": _to_numpy(cf_results.X),
+            "F": _to_numpy(cf_results.F)
         }
 
     state = {
         "data": data,
         "model_state_dicts": [m.state_dict() for m in models] if models else [],
         "cf_results": cf_data,
-        "F_obs": F_obs,
-        "F_star": F_star,
-        "x_star": x_star,
+        "F_obs": _to_numpy(F_obs),
+        "F_star": _to_numpy(F_star),
+        "x_star": _to_numpy(x_star),
     }
     
     buffer = io.BytesIO()
@@ -140,56 +162,69 @@ def load_state(filepath: str, device: Optional[torch.device] = None) -> AppState
 
 
 def create_state_from_pymoo_result(
-    X: np.ndarray,
-    y: np.ndarray,
+    X,
+    y,
     models: List[nn.Module],
     pymoo_result: Any,
     problem: Any,
-    x_star: np.ndarray,
-    p_true: Optional[np.ndarray] = None,
+    x_star,
+    p_true = None,
 ) -> AppState:
     """
     Create an AppState from pymoo optimization result and problem.
     
     This is the recommended interface - it automatically calculates F_obs and F_star
-    from the problem object.
+    from the problem object. Accepts both numpy arrays and torch tensors.
     
     Args:
-        X: Training data features, shape (n_samples, n_features)
-        y: Training data labels, shape (n_samples,)
+        X: Training data features, shape (n_samples, n_features) - numpy or tensor
+        y: Training data labels, shape (n_samples,) - numpy or tensor
         models: List of trained PyTorch models (ensemble)
         pymoo_result: Result object from pymoo minimize() with .X and .F attributes
         problem: The pymoo Problem used for optimization (has .evaluate() method)
-        x_star: Factual point coordinates, shape (n_features,)
-        p_true: Optional true probability values, shape (n_samples,)
+        x_star: Factual point coordinates, shape (n_features,) - numpy or tensor
+        p_true: Optional true probability values, shape (n_samples,) - numpy or tensor
     
     Returns:
         AppState object ready to be saved with save_state()
     """
+    # Convert inputs to numpy for Streamlit compatibility
+    X = _to_numpy(X)
+    y = _to_numpy(y)
+    x_star = _to_numpy(x_star)
+    
     # Create p_true if not provided
     if p_true is None:
         p_true = np.zeros(len(y), dtype=np.float32)
+    else:
+        p_true = _to_numpy(p_true)
     
-    # Create data tuple
+    # Create data tuple (all numpy)
     data = (X, y, p_true)
     
-    # Extract CF results from pymoo result
-    cf_results = CFResult(X=pymoo_result.X, F=pymoo_result.F)
+    # Extract CF results from pymoo result (convert to numpy)
+    cf_results = CFResult(X=_to_numpy(pymoo_result.X), F=_to_numpy(pymoo_result.F))
     
-    # Calculate F_obs (objectives for observed data)
+    # Calculate F_obs (objectives for observed data) - X is already numpy
     try:
-        F_obs = np.array(problem.evaluate(X))
+        out = {}
+        problem._evaluate(X, out)
+        F_obs = _to_numpy(out.get('F'))
     except Exception:
+        # Fallback: evaluate one at a time
         F_list = []
         for i in range(len(X)):
-            f = problem.evaluate(X[i:i+1])
-            F_list.append(f[0] if len(f.shape) > 1 else f)
-        F_obs = np.array(F_list)
+            out = {}
+            problem._evaluate(X[i:i+1], out)
+            f = _to_numpy(out.get('F'))
+            F_list.append(f[0] if f is not None and len(f.shape) > 1 else f)
+        F_obs = np.array(F_list) if F_list else None
     
     # Calculate F_star (objectives for factual point)
-    x_star = np.asarray(x_star)
     try:
-        F_star = np.array(problem.evaluate(x_star.reshape(1, -1)))
+        out = {}
+        problem._evaluate(x_star.reshape(1, -1), out)
+        F_star = _to_numpy(out.get('F'))
     except Exception:
         F_star = None
     
@@ -205,28 +240,29 @@ def create_state_from_pymoo_result(
 
 def create_and_save_state(
     filepath: str,
-    X: np.ndarray,
-    y: np.ndarray,
+    X,
+    y,
     models: List[nn.Module],
     pymoo_result: Any,
     problem: Any,
-    x_star: np.ndarray,
-    p_true: Optional[np.ndarray] = None,
+    x_star,
+    p_true = None,
 ) -> AppState:
     """
     Create and save state from pymoo result in one step.
     
     This is the simplest interface - just pass your data, models, and pymoo result.
+    Accepts both numpy arrays and torch tensors.
     
     Args:
         filepath: Path to save the state file
-        X: Training data features, shape (n_samples, n_features)
-        y: Training data labels, shape (n_samples,)
+        X: Training data features, shape (n_samples, n_features) - numpy or tensor
+        y: Training data labels, shape (n_samples,) - numpy or tensor
         models: List of trained PyTorch models (ensemble)
         pymoo_result: Result object from pymoo minimize() with .X and .F attributes
         problem: The pymoo Problem used for optimization
-        x_star: Factual point coordinates, shape (n_features,)
-        p_true: Optional true probability values
+        x_star: Factual point coordinates, shape (n_features,) - numpy or tensor
+        p_true: Optional true probability values - numpy or tensor
     
     Returns:
         AppState object that was saved
