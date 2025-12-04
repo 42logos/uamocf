@@ -464,13 +464,22 @@ if st.sidebar.button("Run Counterfactual Search"):
         
         # Evaluate objectives for all observed points for context
         with st.spinner("Evaluating Context..."):
-            F_obs = np.array(problem.evaluate(X))
-            st.session_state.F_obs = F_obs
+            # Use problem._evaluate which is the internal method, returns numpy via out dict
+            out = {}
+            problem._evaluate(X, out)
+            F_obs = out.get('F')
+            if isinstance(F_obs, torch.Tensor):
+                F_obs = F_obs.cpu().numpy()
+            st.session_state.F_obs = np.asarray(F_obs)
             
             # Evaluate objectives for x*
             x_star_np = x_star.cpu().numpy()
-            F_star = np.array(problem.evaluate(x_star_np))
-            st.session_state.F_star = F_star
+            out = {}
+            problem._evaluate(x_star_np, out)
+            F_star = out.get('F')
+            if isinstance(F_star, torch.Tensor):
+                F_star = F_star.cpu().numpy()
+            st.session_state.F_star = np.asarray(F_star)
 
         st.session_state.cf_results = res
         st.success("Search Complete!")

@@ -292,6 +292,22 @@ def plot_proba(
     return fig, ax
 
 
+def _to_numpy(arr) -> Optional[np.ndarray]:
+    """Safely convert tensor or array to numpy for visualization.
+    
+    Args:
+        arr: Input array (numpy, torch tensor, or None)
+        
+    Returns:
+        Numpy array, or None if input was None
+    """
+    if arr is None:
+        return None
+    if isinstance(arr, torch.Tensor):
+        return arr.detach().cpu().numpy()
+    return np.asarray(arr)
+
+
 def get_design_space_fig(
     torch_model: nn.Module,
     X: Array,
@@ -322,11 +338,17 @@ def get_design_space_fig(
     - x* (Factual)
     - Pareto Set (Counterfactuals)
     """
-    X = np.asarray(X)
+    # Ensure all inputs are numpy arrays for Streamlit/Plotly compatibility
+    X = _to_numpy(X)
+    Y = _to_numpy(Y)
+    x_star = _to_numpy(x_star)
+    pareto_X = _to_numpy(pareto_X)
     
     # Default indices if not provided
     if X_indices is None:
         X_indices = np.arange(len(X))
+    else:
+        X_indices = _to_numpy(X_indices)
     
     # 1. Create Grid & Predict
     if x_range is not None:
@@ -366,10 +388,17 @@ def get_design_space_fig(
             # Fallback if no ensemble
             Z = np.zeros_like(xx)
         else:
-            # Convert to EnsembleModel if needed
-            ensemble = models if isinstance(models, EnsembleModel) else EnsembleModel(list(models)).to(device)
-            au = aleatoric_from_models(ensemble, grid_points)
-            Z = au.reshape(xx.shape)
+            # Convert to EnsembleModel if needed, ensure on correct device
+            if isinstance(models, EnsembleModel):
+                ensemble = models
+            else:
+                ensemble = EnsembleModel(list(models))
+            # Move ensemble to device if specified
+            if device is not None:
+                ensemble = ensemble.to(device)
+            # aleatoric_from_models accepts numpy and returns numpy
+            au = aleatoric_from_models(ensemble, grid_points.astype(np.float32))
+            Z = np.asarray(au).reshape(xx.shape)
         colorscale = 'Viridis'
         zmin, zmax = None, None
         colorbar_title = "AU"
@@ -378,10 +407,17 @@ def get_design_space_fig(
         if models is None:
             Z = np.zeros_like(xx)
         else:
-            # Convert to EnsembleModel if needed
-            ensemble = models if isinstance(models, EnsembleModel) else EnsembleModel(list(models)).to(device)
-            eu = epistemic_from_models(ensemble, grid_points)
-            Z = eu.reshape(xx.shape)
+            # Convert to EnsembleModel if needed, ensure on correct device
+            if isinstance(models, EnsembleModel):
+                ensemble = models
+            else:
+                ensemble = EnsembleModel(list(models))
+            # Move ensemble to device if specified
+            if device is not None:
+                ensemble = ensemble.to(device)
+            # epistemic_from_models accepts numpy and returns numpy
+            eu = epistemic_from_models(ensemble, grid_points.astype(np.float32))
+            Z = np.asarray(eu).reshape(xx.shape)
         colorscale = 'Plasma'
         zmin, zmax = None, None
         colorbar_title = "EU"

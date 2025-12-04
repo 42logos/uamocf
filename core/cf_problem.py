@@ -9,36 +9,8 @@ from core.models import EnsembleModel
 
 import numpy as np
 import torch
-from pymoo.problems.functional import FunctionalProblem
+from pymoo.core.problem import Problem
 from torch import nn
-
-Array = Union[np.ndarray, torch.Tensor]
-
-# =============================================================================
-# Tensor Utility Functions
-# =============================================================================
-
-def is_tensor(x: Array) -> bool:
-    """Check if input is a PyTorch tensor."""
-    return isinstance(x, torch.Tensor)
-
-
-def to_numpy(x: Array) -> np.ndarray:
-    """Convert tensor or numpy array to numpy."""
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def to_tensor(x: Array, device: Optional[torch.device] = None) -> torch.Tensor:
-    """Convert numpy array or tensor to tensor on specified device."""
-    if isinstance(x, torch.Tensor):
-        t = x
-    else:
-        t = torch.from_numpy(np.asarray(x).astype(np.float32))
-    if device is not None:
-        t = t.to(device)
-    return t
 
 def _gower_distance_tensor(x: torch.Tensor, y: torch.Tensor, feature_range: torch.Tensor) -> torch.Tensor:
     """
@@ -72,67 +44,53 @@ def _k_nearest_tensor(x: torch.Tensor, X_obs: torch.Tensor, k: int) -> Tuple[tor
     nearest_idx = torch.argsort(dists)[:k]
     return X_obs[nearest_idx], dists[nearest_idx]
 
-def _gower_distance(x: Array, y: Array, feature_range: Array) -> Array:
+def _gower_distance_batch(X: torch.Tensor, y: torch.Tensor, feature_range: torch.Tensor) -> torch.Tensor:
     """
-    Compute normalized feature-wise dissimilarity (Gower distance).
-    
-    δ_G(u, v) = |u - v| / range for numerical features
+    Compute normalized feature-wise dissimilarity (Gower distance) for batch.
     
     Args:
-        x, y: Feature vectors
-        feature_range: Range of each feature
+        X: Batch of feature vectors, shape (N, d)
+        y: Reference point, shape (d,)
+        feature_range: Range of each feature, shape (d,)
         
     Returns:
-        Per-feature dissimilarity, shape (d,)
+        Per-sample mean Gower distance, shape (N,)
     """
-    return np.minimum(np.abs(x - y) / feature_range, 1.0)
+    per_feature = torch.clamp(torch.abs(X - y) / feature_range, max=1.0)  # (N, d)
+    return per_feature.mean(dim=1)  # (N,)
 
-def _k_nearest(x: Array, X_obs: Array, k: int) -> Tuple[Array, Array]:
+def _k_nearest_batch(X: torch.Tensor, X_obs: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Find k nearest neighbors to x in X_obs.
+    Find k nearest neighbors for each point in batch X.
     
     Args:
-        x: Query point
-        X_obs: Observed data points
+        X: Query points, shape (N, d)
+        X_obs: Observed data points, shape (M, d)
         k: Number of neighbors
         
     Returns:
-        nearest_points: shape (k, d)
-        distances: shape (k,)
+        nearest_indices: shape (N, k)
+        distances: shape (N, k)
     """
-    dists = np.linalg.norm(X_obs - x, axis=1)
-    nearest_idx = np.argsort(dists)[:k]
-    return X_obs[nearest_idx], dists[nearest_idx]
+    # Compute pairwise distances: (N, M)
+    dists = torch.cdist(X, X_obs)
+    # Get k nearest for each query point
+    distances, nearest_idx = torch.topk(dists, k, dim=1, largest=False)
+    return nearest_idx, distances
 
 
-def aleatoric_from_models(
-    model_ensemble: EnsembleModel, 
-    x: Array,
-    return_tensor: bool = False,
-) -> Array:
+def aleatoric_from_models_tensor(model_ensemble: EnsembleModel, x_t: torch.Tensor) -> torch.Tensor:
     """
     Average aleatoric uncertainty across an ensemble of models.
-    Supports both single point (d,) and batch (N, d).
+    Pure torch tensor version - no numpy conversions.
     
     Args:
-        model_ensemble: Ensemble of trained models
-        x: Input points, shape (d,) or (N, d) - can be tensor or numpy
-        return_tensor: If True, return tensor; if False, return numpy.
-                       Default False for backward compatibility.
-                       If input is tensor and return_tensor not specified,
-                       returns tensor to avoid unnecessary conversion.
-    
+        model_ensemble: Ensemble of models
+        x_t: Input tensor on device, shape (N, d) or (N, C, H, W)
+        
     Returns:
-        Aleatoric uncertainty, shape (N,) or scalar
+        Aleatoric uncertainty tensor, shape (N,)
     """
-    input_is_tensor = is_tensor(x)
-    
-    is_batch = x.ndim > 1
-    if not is_batch:
-        x = x[None, :]  # (1, d)
-    
-    x_t = to_tensor(x, device=model_ensemble.device)
-    
     # Collect probabilities from all models
     all_probs = []
     with torch.no_grad():
@@ -145,56 +103,41 @@ def aleatoric_from_models(
     all_probs = torch.stack(all_probs)
     
     # Aleatoric uncertainty = Mean of Entropies
-    # Entropy of each model: -sum(p log p)
     entropies = -torch.sum(all_probs * torch.log(all_probs + 1e-12), dim=-1)  # (n_models, N)
     mean_entropy = torch.mean(entropies, dim=0)  # (N,)
     
-    # Decide output format
-    should_return_tensor = return_tensor or input_is_tensor
-    
-    if should_return_tensor:
-        return mean_entropy if is_batch else mean_entropy[0]
-    else:
-        result = mean_entropy.cpu().numpy()
-        return result if is_batch else result[0]
+    return mean_entropy
 
-def Total_uncertainty(
-    model_ensemble: EnsembleModel, 
-    x: Array, 
-    device: Optional[torch.device] = None,
-    return_tensor: bool = False,
-) -> Union[float, Array]:
+
+def aleatoric_from_models(model_ensemble: EnsembleModel, x) -> np.ndarray:
     """
-    Total uncertainty = Entropy of the mean predictive distribution.
-    
-    Correct formulation:
-    1. Get softmax probabilities from each model
-    2. Average the probabilities (not logits!)
-    3. Compute entropy of the averaged distribution
-    
-    Supports both single point (d,) and batch (N, d).
-    
-    Args:
-        model_ensemble: Ensemble of trained models
-        x: Input points, shape (d,) or (N, d) - can be tensor or numpy
-        device: PyTorch device (defaults to model_ensemble.device)
-        return_tensor: If True, return tensor; if False, return numpy.
-                       If input is tensor and return_tensor not specified,
-                       returns tensor to avoid unnecessary conversion.
-    
-    Returns:
-        Total uncertainty, shape (N,) or scalar
+    Average aleatoric uncertainty across an ensemble of models.
+    Legacy wrapper that returns numpy array for backward compatibility.
     """
     input_is_tensor = is_tensor(x)
     
     is_batch = x.ndim > 1
     if not is_batch:
-        x = x[None, :]  # (1, d)
+        x = x[None, :]
+        
+    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
+    x_t = x_t.to(model_ensemble.device)
     
-    if device is None:
-        device = model_ensemble.device
-    x_t = to_tensor(x, device=device)
+    result = aleatoric_from_models_tensor(model_ensemble, x_t)
+    return result.cpu().numpy()
+
+def total_uncertainty_tensor(model_ensemble: EnsembleModel, x_t: torch.Tensor) -> torch.Tensor:
+    """
+    Total uncertainty = Entropy of the mean predictive distribution.
+    Pure torch tensor version - no numpy conversions.
     
+    Args:
+        model_ensemble: Ensemble of models
+        x_t: Input tensor on device, shape (N, d) or (N, C, H, W)
+        
+    Returns:
+        Total uncertainty tensor, shape (N,)
+    """
     # Collect probabilities from all models
     all_probs = []
     with torch.no_grad():
@@ -212,58 +155,228 @@ def Total_uncertainty(
     # Total uncertainty = entropy of mean prediction
     ent = -torch.sum(mean_probs * torch.log(mean_probs + 1e-12), dim=-1)  # (N,)
     
-    # Decide output format
-    should_return_tensor = return_tensor or input_is_tensor
-    
-    if should_return_tensor:
-        return ent if is_batch else ent[0]
-    else:
-        result = ent.cpu().numpy()
-        return float(result[0]) if not is_batch else result
+    return ent
 
-def epistemic_from_models(
-    model_ensemble: EnsembleModel, 
-    x: Array,
-    return_tensor: bool = False,
-) -> Union[float, Array]:
+
+def epistemic_from_models_tensor(model_ensemble: EnsembleModel, x_t: torch.Tensor) -> torch.Tensor:
     """
     Epistemic uncertainty from an ensemble of models.
+    Pure torch tensor version - no numpy conversions.
     
     EU = TU - AU = H[E[p]] - E[H[p]]
     
-    Where:
-    - TU = Total Uncertainty = Entropy of mean prediction
-    - AU = Aleatoric Uncertainty = Mean of individual entropies
-    - EU = Epistemic Uncertainty = Disagreement between models
-    
-    EU is always >= 0 by Jensen's inequality.
-    
-    Supports both single point (d,) and batch (N, d).
-    Supports both tensor and numpy inputs.
-    
     Args:
-        model_ensemble: Ensemble of trained models
-        x: Input points, shape (d,) or (N, d) - can be tensor or numpy
-        return_tensor: If True, return tensor; if False, return numpy.
-                       If input is tensor and return_tensor not specified,
-                       returns tensor to avoid unnecessary conversion.
-    
+        model_ensemble: Ensemble of models
+        x_t: Input tensor on device, shape (N, d) or (N, C, H, W)
+        
     Returns:
-        Epistemic uncertainty, shape (N,) or scalar
+        Epistemic uncertainty tensor, shape (N,)
     """
-    input_is_tensor = is_tensor(x)
-    should_return_tensor = return_tensor or input_is_tensor
-    
-    # Compute using tensors internally
-    AU = aleatoric_from_models(model_ensemble, x, return_tensor=True)
-    TU = Total_uncertainty(model_ensemble, x, return_tensor=True)
+    AU = aleatoric_from_models_tensor(model_ensemble, x_t)
+    TU = total_uncertainty_tensor(model_ensemble, x_t)
     EU = TU - AU
+    # EU should be non-negative by Jensen's inequality, clamp for numerical stability
+    return torch.clamp(EU, min=0.0)
+
+
+def Total_uncertainty(model_ensemble: EnsembleModel, x, device: Optional[torch.device] = None) -> Union[float, np.ndarray]:
+    """
+    Total uncertainty = Entropy of the mean predictive distribution.
+    Legacy wrapper that returns numpy array for backward compatibility.
+    """
+    is_batch = x.ndim > 1
+    if not is_batch:
+        x = x[None, :]
     
-    # EU should be non-negative by Jensen's inequality, but clamp for numerical stability
-    if should_return_tensor:
-        return torch.clamp(EU, min=0.0)
-    else:
-        return np.maximum(to_numpy(EU), 0.0)
+    if device is None:
+        device = model_ensemble.device
+    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
+    x_t = x_t.to(device)
+    
+    result = total_uncertainty_tensor(model_ensemble, x_t)
+    result_np = result.cpu().numpy()
+    
+    if not is_batch:
+        return float(result_np[0])
+    return result_np
+
+
+def epistemic_from_models(model_ensemble: EnsembleModel, x) -> Union[float, np.ndarray]:
+    """
+    Epistemic uncertainty from an ensemble of models.
+    Legacy wrapper that returns numpy array for backward compatibility.
+    """
+    is_batch = x.ndim > 1
+    if not is_batch:
+        x = x[None, :]
+        
+    x_t = x if isinstance(x, torch.Tensor) else torch.from_numpy(x.astype(np.float32))
+    x_t = x_t.to(model_ensemble.device)
+    
+    result = epistemic_from_models_tensor(model_ensemble, x_t)
+    result_np = result.cpu().numpy()
+    
+    if not is_batch:
+        return float(result_np[0])
+    return result_np
+
+class TorchCFProblem(Problem):
+    """
+    Counterfactual optimization problem with full GPU batch computation.
+    
+    All computations are done on GPU using torch tensors. Only converts to
+    numpy at the pymoo interface boundary for maximum efficiency.
+    
+    Objectives (with ensemble):
+    - o1: Validity (1 - P(target))
+    - o2: Epistemic Uncertainty
+    - o3: Sparsity
+    - o4: -Aleatoric Uncertainty (negated to maximize)
+    
+    Objectives (without ensemble):
+    - o1: Validity
+    - o2: Similarity
+    - o3: Sparsity
+    - o4: Plausibility
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        x_factual: torch.Tensor,
+        y_target: torch.Tensor,
+        X_obs: torch.Tensor,
+        k_neighbors: int = 10,
+        use_soft_validity: bool = True,
+        normalize_similarity: bool = True,
+        sparsity_eps: float = 0.005,
+        ensemble: Optional[EnsembleModel] = None,
+        device: Optional[torch.device] = None,
+    ):
+        self.model = model
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.ensemble = ensemble
+        self.use_soft_validity = use_soft_validity
+        self.normalize_similarity = normalize_similarity
+        self.sparsity_eps = sparsity_eps
+        self.k_neighbors = k_neighbors
+        
+        model.eval()
+        if ensemble is not None:
+            for m in ensemble.models:
+                m.eval()
+        
+        # Store dimensions
+        self.p = x_factual.flatten().shape[0]
+        self.input_shape = x_factual.shape
+        
+        # Store tensors on device
+        self.X_obs_flat = X_obs.reshape(X_obs.shape[0], -1).to(self.device)
+        self.x_factual_flat = x_factual.flatten().to(self.device)
+        
+        # Compute bounds
+        xl = torch.min(self.X_obs_flat, dim=0).values
+        xu = torch.max(self.X_obs_flat, dim=0).values
+        self.feature_range = xu - xl
+        self.feature_range[self.feature_range == 0] = 1.0
+        
+        # Store target labels
+        self.target_labels = y_target.view(-1).long().to(self.device)
+        
+        # Neighbor weights
+        self.w = torch.ones(k_neighbors, device=self.device) / k_neighbors
+        
+        # Determine number of objectives
+        n_obj = 4
+        
+        # Initialize parent Problem
+        super().__init__(
+            n_var=self.p,
+            n_obj=n_obj,
+            xl=xl.cpu().numpy(),
+            xu=xu.cpu().numpy(),
+        )
+    
+    def _to_model_input(self, X_t: torch.Tensor) -> torch.Tensor:
+        """Reshape flat batch to model input shape."""
+        batch_size = X_t.shape[0]
+        # Determine target shape based on input_shape
+        if len(self.input_shape) == 4:  # (1, C, H, W)
+            target_shape = (batch_size, self.input_shape[1], self.input_shape[2], self.input_shape[3])
+        elif len(self.input_shape) == 3:  # (C, H, W)
+            target_shape = (batch_size, self.input_shape[0], self.input_shape[1], self.input_shape[2])
+        else:  # (d,) or (1, d)
+            target_shape = (batch_size, self.p)
+        return X_t.view(target_shape)
+    
+    def _evaluate(self, X: np.ndarray, out: dict, *args, **kwargs):
+        """
+        Batch evaluation of all objectives on GPU.
+        
+        Args:
+            X: Decision variables, shape (pop_size, n_var)
+            out: Output dictionary for objectives
+        """
+        # ONE conversion to GPU tensor per generation
+        X_t = torch.from_numpy(X).float().to(self.device)
+        batch_size = X_t.shape[0]
+        
+        # Reshape for model input
+        X_model = self._to_model_input(X_t)
+        
+        # ===== OBJECTIVE 1: Validity =====
+        with torch.no_grad():
+            logits = self.model(X_model)
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            probs = torch.softmax(logits, dim=1)
+        
+        if self.use_soft_validity:
+            # Sum probabilities of target classes
+            prob_target = probs[:, self.target_labels].sum(dim=1)  # (N,)
+            f1_validity = 1.0 - prob_target
+        else:
+            preds = probs.argmax(dim=1)
+            # Check if prediction is in target labels
+            is_valid = torch.isin(preds, self.target_labels)
+            f1_validity = torch.where(is_valid, torch.zeros_like(preds, dtype=torch.float32), torch.ones_like(preds, dtype=torch.float32))
+        
+        # ===== OBJECTIVE 3: Sparsity (computed before 2 for efficiency) =====
+        changed = torch.abs(X_t - self.x_factual_flat) > self.sparsity_eps  # (N, p)
+        f3_sparsity = changed.sum(dim=1).float()  # (N,)
+        
+        if self.ensemble is not None and len(self.ensemble.models) > 0:
+            # ===== OBJECTIVE 2: Epistemic Uncertainty =====
+            f2_epistemic = epistemic_from_models_tensor(self.ensemble, X_model)  # (N,)
+            
+            # ===== OBJECTIVE 4: -Aleatoric Uncertainty (negated to maximize) =====
+            f4_aleatoric_neg = -aleatoric_from_models_tensor(self.ensemble, X_model)  # (N,)
+            
+            # Stack objectives: [Validity, Epistemic, Sparsity, -AU]
+            F = torch.stack([f1_validity, f2_epistemic, f3_sparsity, f4_aleatoric_neg], dim=1)
+        else:
+            # ===== OBJECTIVE 2: Similarity =====
+            if self.normalize_similarity:
+                f2_similarity = _gower_distance_batch(X_t, self.x_factual_flat, self.feature_range)
+            else:
+                f2_similarity = torch.norm(X_t - self.x_factual_flat, dim=1)
+            
+            # ===== OBJECTIVE 4: Plausibility (k-nearest neighbors) =====
+            nearest_idx, _ = _k_nearest_batch(X_t, self.X_obs_flat, self.k_neighbors)  # (N, k)
+            
+            # Compute weighted distance to neighbors
+            f4_plausibility = torch.zeros(batch_size, device=self.device)
+            for i in range(batch_size):
+                neighbor_points = self.X_obs_flat[nearest_idx[i]]  # (k, p)
+                dists = _gower_distance_batch(neighbor_points, X_t[i], self.feature_range)  # (k,)
+                f4_plausibility[i] = (dists * self.w).sum()
+            
+            # Stack objectives: [Validity, Similarity, Sparsity, Plausibility]
+            F = torch.stack([f1_validity, f2_similarity, f3_sparsity, f4_plausibility], dim=1)
+        
+        # ONE conversion to numpy at output
+        out['F'] = F.cpu().numpy()
+
 
 def make_cf_problem(
     model: nn.Module,
@@ -276,165 +389,50 @@ def make_cf_problem(
     sparsity_eps: float = 0.005,
     ensemble: Optional[EnsembleModel] = None,
     device: Optional[torch.device] = None,
-) -> FunctionalProblem:
+) -> TorchCFProblem:
     """
-    Create a counterfactual problem for 2D feature space.
+    Create a counterfactual problem for feature space optimization.
     
-    Objectives:
-    - o1: Validity (soft or hard)
+    This is a factory function that creates a TorchCFProblem with full GPU
+    batch computation support. All objectives are computed on GPU and only
+    converted to numpy at the pymoo interface.
+    
+    Objectives (with ensemble):
+    - o1: Validity (1 - P(target))
+    - o2: Epistemic Uncertainty
+    - o3: Sparsity
+    - o4: -Aleatoric Uncertainty (negated to maximize)
+    
+    Objectives (without ensemble):
+    - o1: Validity
     - o2: Similarity
     - o3: Sparsity
     - o4: Plausibility
-    - o5: Aleatoric Uncertainty (negated if maximizing)
-    - o6: Epistemic Uncertainty
     
     Args:
         model: Primary trained classifier
-        x_star: Factual instance, shape (d,)
+        x_factual: Factual instance, shape (d,) or (1, C, H, W)
         y_target: Target class(es), shape (1,) or (k,)
-        X_obs: Observed data, shape (n, d)
-        weights: Neighbor weights, shape (k,)
-        config: CFConfig instance
-        ensemble: Optional model ensemble for uncertainty
+        X_obs: Observed data, shape (n, d) or (n, C, H, W)
+        k_neighbors: Number of neighbors for plausibility
+        use_soft_validity: Use soft validity (probability) or hard (prediction)
+        normalize_similarity: Use Gower distance (True) or L2 norm (False)
+        sparsity_eps: Threshold for considering a feature changed
+        ensemble: Optional model ensemble for uncertainty objectives
         device: PyTorch device
         
     Returns:
-        pymoo FunctionalProblem
+        TorchCFProblem instance for pymoo optimization
     """
-    
-    model.eval()
-    if ensemble is not None:
-        for m in ensemble.models:
-            m.eval()
-
-    w= torch.ones(k_neighbors, device=device)/k_neighbors
-    
-    # Get flattened dimensions
-    p = x_factual.flatten().shape[0]  # Total number of features (e.g., 256 for 16x16)
-    input_shape = x_factual.shape  # Store original shape for reshaping (e.g., (1, 1, 16, 16) for CNN)
-    
-    # Flatten X_obs for computing bounds and distances
-    X_obs_flat = X_obs.reshape(X_obs.shape[0], -1).to(device)  # (n_samples, p)
-    
-    # Feature bounds and range (computed on flattened data)
-    xl = torch.min(X_obs_flat, dim=0).values  # (p,)
-    xu = torch.max(X_obs_flat, dim=0).values  # (p,)
-    feature_range_flat = xu - xl
-    feature_range_flat[feature_range_flat == 0] = 1.0
-    
-    target_labels = y_target.view(-1).long().tolist() 
-    
-    # Flatten tensors for objective functions
-    x_factual_flat = x_factual.flatten().to(device)
-    
-    # Convert numpy array to tensor with proper shape for model input
-    def _to_tensor(x: Array) -> torch.Tensor:
-        """Convert numpy array to flattened tensor."""
-        if isinstance(x, np.ndarray):
-            return torch.from_numpy(x.astype(np.float32)).to(device)
-        return x.to(device)
-    
-    def _to_model_input(x: Array) -> torch.Tensor:
-        """Convert flat array to tensor with proper shape for model."""
-        x_t = _to_tensor(x)
-        # Reshape to original input shape (e.g., (1, 1, 16, 16) for CNN)
-        reshaped = x_t.view(input_shape)
-        # Ensure batch dimension exists
-        if reshaped.dim() == len(input_shape) and input_shape[0] != 1:
-            # No batch dimension, add one
-            reshaped = reshaped.unsqueeze(0)
-        return reshaped
-    
-    # OBJECTIVE FUNCTIONS 
-    def o1_validity(x: Array) -> float:
-        """Validity: 1 - P(target) or hard constraint."""
-        x_t = _to_model_input(x)
-        
-        with torch.no_grad():
-            logits = model(x_t)
-            # Handle both 1D and 2D outputs
-            if logits.dim() == 1:
-                logits = logits.unsqueeze(0)
-            probs = torch.softmax(logits, dim=1)
-        
-        if use_soft_validity:
-            prob_target = probs[0, target_labels].sum().item()
-            return 1.0 - prob_target
-        else:
-            pred = probs.argmax(dim=1).item()
-            return 0.0 if pred in target_labels else 1.0
-    
-    def o2_similarity(x: Array) -> float:
-        """Similarity: mean Gower distance to factual."""
-        x_t = _to_tensor(x)
-        if normalize_similarity:
-            return float(_gower_distance_tensor(x_t, x_factual_flat, feature_range_flat).mean().item())
-        return float(torch.norm(x_t - x_factual_flat).item())
-    
-    def o3_sparsity(x: Array) -> float:
-        """Sparsity: number of changed features."""
-        x_t = _to_tensor(x)
-        changed = torch.abs(x_t - x_factual_flat) > sparsity_eps
-        return float(changed.sum().item())
-    
-    def o4_plausibility(x: Array) -> float:
-        """Plausibility: weighted distance to k-nearest neighbors."""
-        x_t = _to_tensor(x)
-        nearest_samples, _ = _k_nearest_tensor(x_t, X_obs_flat, k_neighbors)
-        per_sample = torch.stack([
-            _gower_distance_tensor(x_t, xi, feature_range_flat).mean()
-            for xi in nearest_samples
-        ])
-        return float((per_sample * w).sum().item())
-    
-    def o5_aleatoric_uncertainty(x: Array) -> float:
-        """Aleatoric Uncertainty (negated to maximize)."""
-        if ensemble is None or len(ensemble.models) == 0:
-            raise ValueError("Ensemble required for aleatoric uncertainty.")
-        au = aleatoric_from_models(ensemble, x)
-        if isinstance(au, np.ndarray) and au.ndim > 0:
-            au = au[0]
-        elif isinstance(au, np.ndarray) and au.ndim == 0:
-            au = au.item()
-        elif isinstance(au, torch.Tensor) and au.ndim > 0:
-            au = au[0].item()
-        return float(-au)  # Negative to maximize AU
-    
-    def o6_epistemic_uncertainty(x: Array) -> float:
-        """Epistemic Uncertainty (minimize - prefer confident regions)."""
-        if ensemble is None or len(ensemble.models) == 0:
-            raise ValueError("Ensemble required for epistemic uncertainty.")
-        eu = epistemic_from_models(ensemble, x)
-        if isinstance(eu, np.ndarray) and eu.ndim > 0:
-            eu = eu[0]
-        elif isinstance(eu, np.ndarray) and eu.ndim == 0:
-            eu = eu.item()
-        elif isinstance(eu, torch.Tensor) and eu.ndim > 0:
-            eu = eu[0].item()
-        return float(eu)  # Positive to minimize EU (prefer low epistemic uncertainty)
-    
-    # Build objective list based on available ensemble
-    # Order: [Validity, Epistemic, Sparsity, Aleatoric]
-    # This order matches what vis_tools/app.py expects
-    if ensemble is not None and len(ensemble.models) > 0:
-        objectives = [
-            o1_validity,               # Index 0: Minimize 1 - P(target)
-            o6_epistemic_uncertainty,  # Index 1: Minimize EU (prefer confident regions)
-            o3_sparsity,               # Index 2: Minimize changed features
-            o5_aleatoric_uncertainty,  # Index 3: Maximize AU (minimize -AU)
-        ]
-    else:
-        objectives = [
-            o1_validity,
-            o2_similarity,
-            o3_sparsity,
-            o4_plausibility,
-        ]
-    
-    return FunctionalProblem(
-        n_var=p,
-        objs=objectives,
-        xl=xl.cpu().numpy(),
-        xu=xu.cpu().numpy(),
-        elementwise=True,
+    return TorchCFProblem(
+        model=model,
+        x_factual=x_factual,
+        y_target=y_target,
+        X_obs=X_obs,
+        k_neighbors=k_neighbors,
+        use_soft_validity=use_soft_validity,
+        normalize_similarity=normalize_similarity,
+        sparsity_eps=sparsity_eps,
+        ensemble=ensemble,
+        device=device,
     )

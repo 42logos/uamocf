@@ -495,14 +495,11 @@ def plot_cf_3d(
 
     fig = go.Figure()
 
-    # Compute objective values for X
-    # Note: F[:,3] is negated plausibility/AU in the optimization (to maximize it)
-    # We compute positive AU values here for display
-    X_objs = problem.evaluate(X)
-    X_au_positive = np.abs(X_objs[:, 3])  # Use abs to get positive AU values
-    
+    # Note: Objective 3 (index 3) is -Aleatoric Uncertainty (negated to maximize AU)
+    # We negate it back to show positive AU values in the plot
+    F_X_plot = problem.evaluate(X)
     fig.add_trace(go.Scatter3d(
-        x=X_objs[:,1], y=X_objs[:,0], z=X_au_positive,
+        x=F_X_plot[:,1], y=F_X_plot[:,0], z=-F_X_plot[:,3],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='green', size=3, opacity=0.2),
         name='Original observations in Obj Space'
@@ -523,7 +520,7 @@ def plot_cf_3d(
         fig.add_trace(go.Scatter3d(
             x=context_objs[:, 1],
             y=context_objs[:, 0],
-            z=context_au_positive,
+            z=-context_objs[:, 3],  # -(-AU) = AU
             mode='markers',
             marker=dict(color='green', size=4, opacity=0.2),
             name='Context Points in Obj Space'
@@ -563,10 +560,18 @@ def plot_cf_3d(
             name='Pareto Front which not valid'
         ))
 
-    # Use abs to get positive AU values for display
-    valided_au_positive = np.abs(valided_F_mmo[:, 3])
+    # Only add invalid counterfactuals trace if there are any
+    if len(not_valided_F_mmo) > 0:
+        fig.add_trace(go.Scatter3d(
+            x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=-not_valided_F_mmo[:,3],  # -(-AU) = AU
+            mode='markers',
+            marker=dict(color='blue', size=
+                        5, opacity=1,symbol='cross'),
+            name='Pareto Front which not valid'
+        ))
+
     fig.add_trace(go.Scatter3d(
-        x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=valided_au_positive,
+        x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=-valided_F_mmo[:,3],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='red', size=5, symbol='cross'),
         name='Valid Counterfactuals in Obj Space'
@@ -586,7 +591,7 @@ def plot_cf_3d(
     fig.add_trace(go.Scatter3d(
         x=[factual_obj[1]],
         y=[factual_obj[0]],
-        z=[factual_au_positive],
+        z=[-factual_obj[3]],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='purple', size=6),
         name='Factual Instance x* in Obj Space'
@@ -596,12 +601,16 @@ def plot_cf_3d(
 
     fig.update_layout(
         scene=dict(
-            xaxis_title='Similarity',
-            yaxis_title='Validity (1 - P(target))',
-            zaxis_title='Plausibility (Aleatoric Uncertainty)'
+            xaxis_title='Epistemic Uncertainty (EU)',
+            yaxis_title='Validity (prob-based)',
+            zaxis_title='Aleatoric Uncertainty (AU)'
         ),
         width=900, height=700
     )
+
+    # Reverse z-axis so higher AU (which we maximize) is at the bottom
+    # This makes the Pareto front visually intuitive: minimize = down direction
+    fig.update_layout(scene=dict(zaxis=dict(autorange='reversed')))
 
     fig.show()
 
