@@ -441,8 +441,11 @@ def plot_cf_3d(
 
     fig = go.Figure()
 
+    # Note: Objective 3 (index 3) is -Aleatoric Uncertainty (negated to maximize AU)
+    # We negate it back to show positive AU values in the plot
+    F_X_plot = problem.evaluate(X)
     fig.add_trace(go.Scatter3d(
-        x=problem.evaluate(X)[:,1], y=problem.evaluate(X)[:,0], z=-problem.evaluate(X)[:,3],
+        x=F_X_plot[:,1], y=F_X_plot[:,0], z=-F_X_plot[:,3],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='green', size=3, opacity=0.2),
         name='Original observations in Obj Space'
@@ -462,7 +465,7 @@ def plot_cf_3d(
         fig.add_trace(go.Scatter3d(
             x=context_objs[:, 1],
             y=context_objs[:, 0],
-            z=-context_objs[:, 3],
+            z=-context_objs[:, 3],  # -(-AU) = AU
             mode='markers',
             marker=dict(color='green', size=4, opacity=0.2),
             name='Context Points in Obj Space'
@@ -493,7 +496,7 @@ def plot_cf_3d(
     not_valided_F_mmo = np.array(not_valided_F_mmo)
 
     fig.add_trace(go.Scatter3d(
-        x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=-not_valided_F_mmo[:,3],
+        x=not_valided_F_mmo[:,1], y=not_valided_F_mmo[:,0], z=-not_valided_F_mmo[:,3],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='blue', size=
                     5, opacity=1,symbol='cross'),
@@ -501,7 +504,7 @@ def plot_cf_3d(
     ))
 
     fig.add_trace(go.Scatter3d(
-        x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=-valided_F_mmo[:,3],
+        x=valided_F_mmo[:,1], y=valided_F_mmo[:,0], z=-valided_F_mmo[:,3],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='red', size=5, symbol='cross'),
         name='Valid Counterfactuals in Obj Space'
@@ -520,7 +523,7 @@ def plot_cf_3d(
     fig.add_trace(go.Scatter3d(
         x=[factual_obj[1]],
         y=[factual_obj[0]],
-        z=[-factual_obj[3]],
+        z=[-factual_obj[3]],  # -(-AU) = AU
         mode='markers',
         marker=dict(color='purple', size=6),
         name='Factual Instance x* in Obj Space'
@@ -530,14 +533,15 @@ def plot_cf_3d(
 
     fig.update_layout(
         scene=dict(
-            xaxis_title='similarity/epistemic uncertainty',
-            yaxis_title='prob-based validity',
-            zaxis_title='plausibility/aleotoric uncertainty'
+            xaxis_title='Epistemic Uncertainty (EU)',
+            yaxis_title='Validity (prob-based)',
+            zaxis_title='Aleatoric Uncertainty (AU)'
         ),
         width=900, height=700
     )
 
-    # reverse z axis
+    # Reverse z-axis so higher AU (which we maximize) is at the bottom
+    # This makes the Pareto front visually intuitive: minimize = down direction
     fig.update_layout(scene=dict(zaxis=dict(autorange='reversed')))
 
     fig.show()

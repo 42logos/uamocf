@@ -7,6 +7,9 @@ multi-objective counterfactual optimization.
 Includes MOC-style modifications:
 - Modified crowding distance (objective space L1 + feature space Gower)
 - Conditional Mutator (samples from conditional distributions using transformation trees)
+
+All runtime computations use torch tensors on GPU for efficiency.
+Numpy is only used at pymoo interface boundaries.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.callback import Callback
 from pymoo.core.mutation import Mutation
@@ -30,10 +34,6 @@ from pymoo.operators.survival.rank_and_crowding import RankAndCrowding
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from pymoo.optimize import minimize
 from pymoo.termination import get_termination
-import torch
-
-
-Array = Union[np.ndarray, torch.Tensor]
 
 
 # =============================================================================
@@ -202,17 +202,20 @@ class ConditionalMutator(Mutation):
         """
         Perform conditional mutation on the population.
         
+        Note: sklearn DecisionTree requires numpy, so we keep numpy for tree operations.
+        The transformation tree training is done once at init, not per-generation.
+        
         Args:
             problem: The optimization problem
             X: Decision variables of offspring, shape (n_offspring, n_var)
             
         Returns:
-            Mutated decision variables
+            Mutated decision variables (numpy array for pymoo)
         """
         n_offspring, n_var = X.shape
         X_mutated = X.copy()
         
-        # Get bounds
+        # Get bounds as numpy (problem.xl/xu are numpy arrays)
         xl, xu = problem.xl, problem.xu
         
         # Random generator
@@ -220,22 +223,17 @@ class ConditionalMutator(Mutation):
         
         for i in range(n_offspring):
             # Randomize feature order for this individual
-            # (important since mutations are conditionally dependent)
             feature_order = rng.permutation(n_var)
             
             for j in feature_order:
-                # Decide whether to mutate this feature
                 if rng.random() < self.prob:
-                    # Sample from conditional distribution
                     if j < len(self.trees):
                         new_value = self.trees[j].sample(X_mutated[i], rng)
                     else:
-                        # Fallback for features beyond trained trees
                         current_value = X_mutated[i, j]
                         feature_range = xu[j] - xl[j]
                         new_value = current_value + rng.normal(0, self.fallback_std * feature_range)
                     
-                    # Clip to bounds
                     X_mutated[i, j] = np.clip(new_value, xl[j], xu[j])
         
         return X_mutated
@@ -265,43 +263,48 @@ class ResetOperator(Mutation):
     Reference: Dandl et al. "Multi-Objective Counterfactual Explanations"
     """
     
-    def __init__(self, x_factual: np.ndarray, p_reset: float = 0.05):
+    def __init__(self, x_factual, p_reset: float = 0.05, device: Optional[torch.device] = None):
         """
         Args:
-            x_factual: The factual instance x*, shape (n_features,) or (1, n_features)
+            x_factual: The factual instance x*, can be numpy array or torch tensor
             p_reset: Probability of resetting each feature to its factual value.
                      Should be small (e.g., 0.01-0.1) to avoid too much attraction.
+            device: Torch device for GPU computation
         """
         super().__init__()
-        self.x_factual = np.asarray(x_factual).flatten()
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Store factual as torch tensor on device
+        if isinstance(x_factual, torch.Tensor):
+            self.x_factual = x_factual.flatten().to(self.device)
+        else:
+            self.x_factual = torch.from_numpy(np.asarray(x_factual).flatten().astype(np.float32)).to(self.device)
+        
         self.p_reset = p_reset
     
     def _do(self, problem, X, **kwargs) -> np.ndarray:
         """
-        Apply reset operator to the population.
-        
-        For each individual and each feature, with probability p_reset,
-        reset the feature value to the factual value x*_j.
+        Apply reset operator using GPU batch computation.
         
         Args:
             problem: The optimization problem
             X: Decision variables of offspring, shape (n_offspring, n_var)
             
         Returns:
-            Decision variables with some features reset to factual values
+            Decision variables with some features reset to factual values (numpy for pymoo)
         """
-        n_offspring, n_var = X.shape
-        X_reset = X.copy()
+        # Convert to GPU tensor for batch operation
+        X_t = torch.from_numpy(X.astype(np.float32)).to(self.device)
+        n_offspring, n_var = X_t.shape
         
-        # Generate Bernoulli mask: B[i,j] = 1 means reset feature j of individual i
-        rng = np.random.default_rng()
-        B = rng.random((n_offspring, n_var)) < self.p_reset
+        # Generate Bernoulli mask on GPU
+        B = torch.rand(n_offspring, n_var, device=self.device) < self.p_reset
         
         # Apply reset: x_new = B ⊙ x* + (1 - B) ⊙ x̃
-        # Where B=1 means use factual, B=0 means keep mutated
-        X_reset = np.where(B, self.x_factual, X_reset)
+        X_reset = torch.where(B, self.x_factual.unsqueeze(0).expand(n_offspring, -1), X_t)
         
-        return X_reset
+        # Return as numpy for pymoo
+        return X_reset.cpu().numpy()
 
 
 class HybridMutator(Mutation):
@@ -363,150 +366,220 @@ class HybridMutator(Mutation):
 
 
 # =============================================================================
-# Gower Distance for Feature Space Diversity
+# Gower Distance for Feature Space Diversity (Torch-based)
 # =============================================================================
-# Note: Reuses _gower_distance from cf_problem.py for numerical features.
-# This module extends it with categorical feature support for crowding distance.
 
-from core.cf_problem import _gower_distance
+def _get_device() -> torch.device:
+    """Get default device for torch operations."""
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def gower_distance_batch_torch(X: torch.Tensor, 
+                               feature_ranges: torch.Tensor,
+                               feature_types: Optional[np.ndarray] = None) -> torch.Tensor:
+    """
+    Compute pairwise Gower distances for entire population using torch.
+    
+    Args:
+        X: Population decision variables, shape (n_pop, n_var) on device
+        feature_ranges: Range of each feature, shape (n_var,) on device
+        feature_types: Array indicating feature type per dimension (numpy array)
+    
+    Returns:
+        Pairwise Gower distance matrix, shape (n_pop, n_pop)
+    """
+    n_pop, n_var = X.shape
+    device = X.device
+    
+    if feature_types is None:
+        # All numerical - vectorized computation
+        # Compute pairwise absolute differences: |X[i] - X[j]| for all i, j
+        # Using broadcasting: X[i] - X[j] = X[:, None, :] - X[None, :, :]
+        diff = torch.abs(X.unsqueeze(1) - X.unsqueeze(0))  # (n_pop, n_pop, n_var)
+        
+        # Normalize by feature ranges
+        per_feature = torch.clamp(diff / feature_ranges, max=1.0)  # (n_pop, n_pop, n_var)
+        
+        # Mean over features
+        return per_feature.mean(dim=2)  # (n_pop, n_pop)
+    else:
+        # Mixed types - need per-feature handling
+        distances = torch.zeros(n_pop, n_pop, n_var, device=device)
+        
+        for j in range(n_var):
+            if feature_types[j] == 'numerical':
+                if feature_ranges[j] > 0:
+                    distances[:, :, j] = torch.abs(X[:, j].unsqueeze(1) - X[:, j].unsqueeze(0)) / feature_ranges[j]
+            else:
+                # Categorical: indicator function
+                distances[:, :, j] = (X[:, j].unsqueeze(1) != X[:, j].unsqueeze(0)).float()
+        
+        return distances.mean(dim=2)
+
+
+def compute_gower_crowding_distance_torch(X: torch.Tensor, 
+                                          feature_ranges: torch.Tensor,
+                                          feature_types: Optional[np.ndarray] = None) -> torch.Tensor:
+    """
+    Compute crowding distance in feature space using Gower distance (torch version).
+    
+    Args:
+        X: Population decision variables, shape (n_pop, n_var) on device
+        feature_ranges: Range of each feature, shape (n_var,) on device
+        feature_types: Feature type indicators
+        
+    Returns:
+        Feature space crowding distances, shape (n_pop,) on device
+    """
+    n_pop = X.shape[0]
+    device = X.device
+    
+    if n_pop <= 2:
+        return torch.full((n_pop,), float('inf'), device=device)
+    
+    # Compute pairwise Gower distances
+    gower_matrix = gower_distance_batch_torch(X, feature_ranges, feature_types)
+    
+    # Set diagonal to inf (exclude self)
+    gower_matrix.fill_diagonal_(float('inf'))
+    
+    # For crowding: sum of distances to two nearest neighbors
+    sorted_dists, _ = torch.sort(gower_matrix, dim=1)
+    
+    if n_pop > 2:
+        crowding = sorted_dists[:, 0] + sorted_dists[:, 1]
+    else:
+        crowding = sorted_dists[:, 0]
+    
+    return crowding
+
+
+def compute_objective_crowding_distance_l1_torch(F: torch.Tensor) -> torch.Tensor:
+    """
+    Compute crowding distance in objective space using L1 norm (torch version).
+    
+    Args:
+        F: Objective values, shape (n_pop, n_obj) on device
+        
+    Returns:
+        Objective space crowding distances, shape (n_pop,) on device
+    """
+    n_pop, n_obj = F.shape
+    device = F.device
+    
+    if n_pop <= 2:
+        return torch.full((n_pop,), float('inf'), device=device)
+    
+    # Normalize objectives to [0, 1]
+    f_min = F.min(dim=0).values
+    f_max = F.max(dim=0).values
+    f_range = f_max - f_min
+    f_range[f_range == 0] = 1.0
+    
+    F_norm = (F - f_min) / f_range
+    
+    # Compute pairwise L1 distances using broadcasting
+    l1_matrix = torch.abs(F_norm.unsqueeze(1) - F_norm.unsqueeze(0)).sum(dim=2)  # (n_pop, n_pop)
+    
+    # Set diagonal to inf
+    l1_matrix.fill_diagonal_(float('inf'))
+    
+    # Sum of distances to two nearest neighbors
+    sorted_dists, _ = torch.sort(l1_matrix, dim=1)
+    
+    if n_pop > 2:
+        crowding = sorted_dists[:, 0] + sorted_dists[:, 1]
+    else:
+        crowding = sorted_dists[:, 0]
+    
+    return crowding
+
+
+def compute_moc_crowding_distance_torch(X: torch.Tensor, 
+                                         F: torch.Tensor,
+                                         feature_ranges: torch.Tensor,
+                                         feature_types: Optional[np.ndarray] = None,
+                                         alpha: float = 0.5) -> torch.Tensor:
+    """
+    Compute MOC-style modified crowding distance using torch.
+    
+    Combines objective space and feature space distances:
+    CD_MOC = alpha * CD_objective + (1 - alpha) * CD_feature
+    
+    Args:
+        X: Decision variables (features), shape (n_pop, n_var) on device
+        F: Objective values, shape (n_pop, n_obj) on device
+        feature_ranges: Range of each feature, shape (n_var,) on device
+        feature_types: Feature type indicators
+        alpha: Weight for objective space distance
+        
+    Returns:
+        Combined crowding distances, shape (n_pop,) on device
+    """
+    device = X.device
+    
+    # Compute crowding in both spaces
+    cd_objective = compute_objective_crowding_distance_l1_torch(F)
+    cd_feature = compute_gower_crowding_distance_torch(X, feature_ranges, feature_types)
+    
+    # Normalize both to [0, 1]
+    # Handle infinity values
+    cd_obj_finite_mask = torch.isfinite(cd_objective)
+    cd_feat_finite_mask = torch.isfinite(cd_feature)
+    
+    # Normalize objective crowding
+    if cd_obj_finite_mask.any():
+        cd_obj_max = cd_objective[cd_obj_finite_mask].max()
+        cd_obj_max = cd_obj_max if cd_obj_max > 0 else 1.0
+        cd_objective_norm = torch.where(cd_obj_finite_mask, cd_objective / cd_obj_max, 
+                                        torch.tensor(float('inf'), device=device))
+    else:
+        cd_objective_norm = cd_objective
+    
+    # Normalize feature crowding
+    if cd_feat_finite_mask.any():
+        cd_feat_max = cd_feature[cd_feat_finite_mask].max()
+        cd_feat_max = cd_feat_max if cd_feat_max > 0 else 1.0
+        cd_feature_norm = torch.where(cd_feat_finite_mask, cd_feature / cd_feat_max,
+                                      torch.tensor(float('inf'), device=device))
+    else:
+        cd_feature_norm = cd_feature
+    
+    # Combine
+    combined = alpha * cd_objective_norm + (1 - alpha) * cd_feature_norm
+    
+    return combined
+
+
+# Legacy numpy wrappers for backward compatibility
 def gower_distance_mixed(x1: np.ndarray, x2: np.ndarray, 
                          feature_ranges: np.ndarray,
                          feature_types: Optional[np.ndarray] = None) -> float:
-    """
-    Compute Gower distance between two feature vectors with mixed types.
-    
-    Extends the numerical-only Gower distance with categorical support:
-    - Numerical: normalized by feature range |x_j - y_j| / R_j
-    - Categorical/Binary: indicator function I(x_j != y_j)
-    
-    Args:
-        x1, x2: Feature vectors of shape (d,)
-        feature_ranges: Range of each numerical feature (max - min), shape (d,)
-        feature_types: Array indicating feature type per dimension.
-                      'numerical' for continuous, 'categorical' for discrete.
-                      If None, all features are treated as numerical (uses existing impl).
-    
-    Returns:
-        Gower distance in [0, 1]
-    """
-    if feature_types is None:
-        # All numerical - use existing implementation
-        per_feature = _gower_distance(x1, x2, feature_ranges)
-        return float(np.mean(per_feature))
-    
-    d = len(x1)
-    distances = np.zeros(d)
-    
-    for j in range(d):
-        if feature_types[j] == 'numerical':
-            # Numerical: normalize by range
-            if feature_ranges[j] > 0:
-                distances[j] = np.abs(x1[j] - x2[j]) / feature_ranges[j]
-            else:
-                distances[j] = 0.0
-        else:
-            # Categorical/Binary: indicator function
-            distances[j] = 1.0 if x1[j] != x2[j] else 0.0
-    
-    return float(np.mean(distances))
+    """Compute Gower distance between two feature vectors (legacy numpy wrapper)."""
+    device = _get_device()
+    X = torch.from_numpy(np.stack([x1, x2]).astype(np.float32)).to(device)
+    fr = torch.from_numpy(feature_ranges.astype(np.float32)).to(device)
+    dist_matrix = gower_distance_batch_torch(X, fr, feature_types)
+    return float(dist_matrix[0, 1].cpu().numpy())
 
 
 def compute_gower_crowding_distance(X: np.ndarray, 
                                     feature_ranges: np.ndarray,
                                     feature_types: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Compute crowding distance in feature space using Gower distance.
-    
-    For each individual, compute the sum of Gower distances to its
-    nearest neighbors (similar to standard crowding distance but in feature space).
-    
-    Args:
-        X: Population decision variables, shape (n_pop, n_var)
-        feature_ranges: Range of each feature, shape (n_var,)
-        feature_types: Feature type indicators
-        
-    Returns:
-        Feature space crowding distances, shape (n_pop,)
-    """
-    n_pop = X.shape[0]
-    
-    if n_pop <= 2:
-        return np.full(n_pop, np.inf)
-    
-    # Compute pairwise Gower distances
-    gower_matrix = np.zeros((n_pop, n_pop))
-    for i in range(n_pop):
-        for j in range(i + 1, n_pop):
-            dist = gower_distance_mixed(X[i], X[j], feature_ranges, feature_types)
-            gower_matrix[i, j] = dist
-            gower_matrix[j, i] = dist
-    
-    # For crowding: sum of distances to two nearest neighbors
-    crowding = np.zeros(n_pop)
-    for i in range(n_pop):
-        # Get distances to all others (excluding self)
-        dists = gower_matrix[i].copy()
-        dists[i] = np.inf  # Exclude self
-        
-        # Find two nearest neighbors
-        sorted_idx = np.argsort(dists)
-        if n_pop > 2:
-            crowding[i] = dists[sorted_idx[0]] + dists[sorted_idx[1]]
-        else:
-            crowding[i] = dists[sorted_idx[0]]
-    
-    return crowding
+    """Compute crowding distance in feature space (legacy numpy wrapper)."""
+    device = _get_device()
+    X_t = torch.from_numpy(X.astype(np.float32)).to(device)
+    fr_t = torch.from_numpy(feature_ranges.astype(np.float32)).to(device)
+    result = compute_gower_crowding_distance_torch(X_t, fr_t, feature_types)
+    return result.cpu().numpy()
 
 
 def compute_objective_crowding_distance_l1(F: np.ndarray) -> np.ndarray:
-    """
-    Compute crowding distance in objective space using L1 norm.
-    
-    Standard crowding distance but using L1 (Manhattan) distance
-    instead of the standard per-objective boundary distance.
-    
-    Args:
-        F: Objective values, shape (n_pop, n_obj)
-        
-    Returns:
-        Objective space crowding distances, shape (n_pop,)
-    """
-    n_pop, n_obj = F.shape
-    
-    if n_pop <= 2:
-        return np.full(n_pop, np.inf)
-    
-    # Normalize objectives to [0, 1] for fair comparison
-    f_min = F.min(axis=0)
-    f_max = F.max(axis=0)
-    f_range = f_max - f_min
-    f_range[f_range == 0] = 1.0  # Avoid division by zero
-    
-    F_norm = (F - f_min) / f_range
-    
-    # Compute pairwise L1 distances
-    l1_matrix = np.zeros((n_pop, n_pop))
-    for i in range(n_pop):
-        for j in range(i + 1, n_pop):
-            dist = np.sum(np.abs(F_norm[i] - F_norm[j]))  # L1 norm
-            l1_matrix[i, j] = dist
-            l1_matrix[j, i] = dist
-    
-    # For crowding: sum of distances to two nearest neighbors
-    crowding = np.zeros(n_pop)
-    for i in range(n_pop):
-        dists = l1_matrix[i].copy()
-        dists[i] = np.inf  # Exclude self
-        
-        sorted_idx = np.argsort(dists)
-        if n_pop > 2:
-            crowding[i] = dists[sorted_idx[0]] + dists[sorted_idx[1]]
-        else:
-            crowding[i] = dists[sorted_idx[0]]
-    
-    return crowding
+    """Compute crowding distance in objective space (legacy numpy wrapper)."""
+    device = _get_device()
+    F_t = torch.from_numpy(F.astype(np.float32)).to(device)
+    result = compute_objective_crowding_distance_l1_torch(F_t)
+    return result.cpu().numpy()
 
 
 def compute_moc_crowding_distance(X: np.ndarray, 
@@ -514,56 +587,13 @@ def compute_moc_crowding_distance(X: np.ndarray,
                                    feature_ranges: np.ndarray,
                                    feature_types: Optional[np.ndarray] = None,
                                    alpha: float = 0.5) -> np.ndarray:
-    """
-    Compute MOC-style modified crowding distance.
-    
-    Combines objective space and feature space distances:
-    CD_MOC = alpha * CD_objective + (1 - alpha) * CD_feature
-    
-    This encourages diversity in both objective space (different trade-offs)
-    and feature space (different actionable changes).
-    
-    Args:
-        X: Decision variables (features), shape (n_pop, n_var)
-        F: Objective values, shape (n_pop, n_obj)
-        feature_ranges: Range of each feature for Gower normalization
-        feature_types: Feature type indicators ('numerical' or 'categorical')
-        alpha: Weight for objective space distance (default 0.5 = equal weighting)
-        
-    Returns:
-        Combined crowding distances, shape (n_pop,)
-    """
-    # Compute crowding in objective space (L1 norm)
-    cd_objective = compute_objective_crowding_distance_l1(F)
-    
-    # Compute crowding in feature space (Gower distance)
-    cd_feature = compute_gower_crowding_distance(X, feature_ranges, feature_types)
-    
-    # Normalize both to [0, 1] for fair combination
-    # Handle infinity values
-    cd_obj_finite = cd_objective[np.isfinite(cd_objective)]
-    cd_feat_finite = cd_feature[np.isfinite(cd_feature)]
-    
-    if len(cd_obj_finite) > 0:
-        cd_obj_max = cd_obj_finite.max() if cd_obj_finite.max() > 0 else 1.0
-        cd_objective_norm = np.where(np.isfinite(cd_objective), 
-                                      cd_objective / cd_obj_max, 
-                                      np.inf)
-    else:
-        cd_objective_norm = cd_objective
-    
-    if len(cd_feat_finite) > 0:
-        cd_feat_max = cd_feat_finite.max() if cd_feat_finite.max() > 0 else 1.0
-        cd_feature_norm = np.where(np.isfinite(cd_feature), 
-                                    cd_feature / cd_feat_max, 
-                                    np.inf)
-    else:
-        cd_feature_norm = cd_feature
-    
-    # Combine with equal weighting (alpha = 0.5)
-    combined = alpha * cd_objective_norm + (1 - alpha) * cd_feature_norm
-    
-    return combined
+    """Compute MOC-style modified crowding distance (legacy numpy wrapper)."""
+    device = _get_device()
+    X_t = torch.from_numpy(X.astype(np.float32)).to(device)
+    F_t = torch.from_numpy(F.astype(np.float32)).to(device)
+    fr_t = torch.from_numpy(feature_ranges.astype(np.float32)).to(device)
+    result = compute_moc_crowding_distance_torch(X_t, F_t, fr_t, feature_types, alpha)
+    return result.cpu().numpy()
 
 
 # =============================================================================
@@ -749,99 +779,126 @@ class NSGAConfig:
 
 class FactualBasedSampling(FloatRandomSampling):
     """
-    Initialize population around the factual instance.
+    Initialize population around the factual instance using GPU computation.
     
     Instead of uniform random sampling, generates samples near x*
     with small perturbations. This helps the optimization start
     from relevant regions of the search space.
     """
     
-    def __init__(self, x_star: Array, noise_scale: float = 0.1):
+    def __init__(self, x_star, noise_scale: float = 0.1, device: Optional[torch.device] = None):
         """
         Args:
-            x_star: Factual instance to sample around
+            x_star: Factual instance to sample around (numpy or torch tensor)
             noise_scale: Standard deviation of Gaussian noise as fraction of range
+            device: Torch device for GPU computation
         """
         super().__init__()
-        self.x_star = np.asarray(x_star).flatten()
+        self.device = device if device is not None else _get_device()
+        
+        # Store factual as torch tensor
+        if isinstance(x_star, torch.Tensor):
+            self.x_star = x_star.flatten().to(self.device)
+        else:
+            self.x_star = torch.from_numpy(np.asarray(x_star).flatten().astype(np.float32)).to(self.device)
+        
         self.noise_scale = noise_scale
     
-    def _do(self, problem, n_samples, **kwargs) -> Array:
-        """Generate samples around the factual."""
-        # Tile factual to create n_samples copies
-        X = np.tile(self.x_star, (n_samples, 1))
+    def _do(self, problem, n_samples, **kwargs) -> np.ndarray:
+        """Generate samples around the factual using GPU."""
+        # Get bounds as tensors
+        xl = torch.from_numpy(problem.xl.astype(np.float32)).to(self.device)
+        xu = torch.from_numpy(problem.xu.astype(np.float32)).to(self.device)
         
-        # Add uniform noise
-        noise = np.random.uniform(
-            -self.noise_scale,
-            self.noise_scale,
-            X.shape
-        )
+        # Tile factual
+        X = self.x_star.unsqueeze(0).expand(n_samples, -1).clone()
+        
+        # Add uniform noise on GPU
+        noise = torch.empty_like(X).uniform_(-self.noise_scale, self.noise_scale)
         X = X + noise
         
-        # Clip to problem bounds
-        X = np.clip(X, problem.xl, problem.xu)
+        # Clip to bounds
+        X = torch.clamp(X, xl, xu)
         
-        return X
+        return X.cpu().numpy()
 
 
 class GaussianFactualSampling(FloatRandomSampling):
     """
-    Sample from Gaussian distribution centered at factual.
+    Sample from Gaussian distribution centered at factual using GPU.
     
     Alternative to uniform noise - may work better for smooth problems.
     """
     
-    def __init__(self, x_star: Array, sigma: float = 0.2):
+    def __init__(self, x_star, sigma: float = 0.2, device: Optional[torch.device] = None):
         super().__init__()
-        self.x_star = np.asarray(x_star).flatten()
+        self.device = device if device is not None else _get_device()
+        
+        if isinstance(x_star, torch.Tensor):
+            self.x_star = x_star.flatten().to(self.device)
+        else:
+            self.x_star = torch.from_numpy(np.asarray(x_star).flatten().astype(np.float32)).to(self.device)
+        
         self.sigma = sigma
     
-    def _do(self, problem, n_samples, **kwargs) -> Array:
-        X = np.random.normal(
-            loc=self.x_star,
-            scale=self.sigma,
-            size=(n_samples, len(self.x_star))
-        )
-        return np.clip(X, problem.xl, problem.xu)
+    def _do(self, problem, n_samples, **kwargs) -> np.ndarray:
+        xl = torch.from_numpy(problem.xl.astype(np.float32)).to(self.device)
+        xu = torch.from_numpy(problem.xu.astype(np.float32)).to(self.device)
+        
+        # Sample from Gaussian on GPU
+        X = torch.randn(n_samples, len(self.x_star), device=self.device) * self.sigma + self.x_star
+        X = torch.clamp(X, xl, xu)
+        
+        return X.cpu().numpy()
 
 
 class MixedSampling(FloatRandomSampling):
     """
-    Mix factual-based and random sampling.
+    Mix factual-based and random sampling using GPU.
     
     A fraction of the population starts near factual, the rest is random.
     """
     
     def __init__(
         self,
-        x_star: Array,
+        x_star,
         factual_fraction: float = 0.5,
         noise_scale: float = 0.2,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
-        self.x_star = np.asarray(x_star).flatten()
+        self.device = device if device is not None else _get_device()
+        
+        if isinstance(x_star, torch.Tensor):
+            self.x_star = x_star.flatten().to(self.device)
+        else:
+            self.x_star = torch.from_numpy(np.asarray(x_star).flatten().astype(np.float32)).to(self.device)
+        
         self.factual_fraction = factual_fraction
         self.noise_scale = noise_scale
     
-    def _do(self, problem, n_samples, **kwargs) -> Array:
+    def _do(self, problem, n_samples, **kwargs) -> np.ndarray:
+        xl = torch.from_numpy(problem.xl.astype(np.float32)).to(self.device)
+        xu = torch.from_numpy(problem.xu.astype(np.float32)).to(self.device)
+        
         n_factual = int(n_samples * self.factual_fraction)
         n_random = n_samples - n_factual
+        n_var = len(self.x_star)
         
-        # Factual-based samples
-        X_factual = np.tile(self.x_star, (n_factual, 1))
-        X_factual += np.random.uniform(
-            -self.noise_scale, self.noise_scale, X_factual.shape
-        )
+        # Factual-based samples on GPU
+        X_factual = self.x_star.unsqueeze(0).expand(n_factual, -1).clone()
+        X_factual += torch.empty_like(X_factual).uniform_(-self.noise_scale, self.noise_scale)
         
-        # Random samples
-        X_random = np.random.uniform(
-            problem.xl, problem.xu,
-            size=(n_random, len(self.x_star))
-        )
+        # Random samples on GPU
+        X_random = torch.empty(n_random, n_var, device=self.device).uniform_(0, 1)
+        X_random = xl + X_random * (xu - xl)
         
-        X = np.vstack([X_factual, X_random])
-        return np.clip(X, problem.xl, problem.xu)
+        # Combine and clip
+        X = torch.cat([X_factual, X_random], dim=0)
+        X = torch.clamp(X, xl, xu)
+        
+        return X.cpu().numpy()
+
 
 @dataclass
 class ProgressEntry:
@@ -1124,8 +1181,9 @@ def run_nsga(
     problem: Problem,
     config: NSGAConfig,
     sampling: Optional[FloatRandomSampling] = None,
-    X_obs: Optional[np.ndarray] = None,
-    x_factual: Optional[np.ndarray] = None,
+    X_obs = None,
+    x_factual = None,
+    device: Optional[torch.device] = None,
 ) -> Result:
     """
     Run NSGA-II optimization on the given problem with specified configuration.
@@ -1135,18 +1193,26 @@ def run_nsga(
     - Conditional Mutator (plausible mutations via transformation trees)
     - Reset Operator (randomly reset features to factual values for sparsity)
     
+    All computations are done on GPU where possible for efficiency.
+    
     Args:
-        problem: The optimization problem
+        problem: The optimization problem (TorchCFProblem recommended)
         config: NSGA-II configuration
         sampling: Optional custom sampling strategy
-        X_obs: Observed training data for conditional mutator, shape (n_samples, n_features).
+        X_obs: Observed training data for conditional mutator.
+               Can be numpy array or torch tensor, shape (n_samples, n_features).
                Required if config.use_conditional_mutator is True.
-        x_factual: The factual instance x*, shape (n_features,) or (1, n_features).
+        x_factual: The factual instance x*.
+                   Can be numpy array or torch tensor, shape (n_features,) or (1, n_features).
                    Required if config.use_reset_operator is True.
+        device: Torch device for GPU computation
                
     Returns:
         Optimization result
     """
+    if device is None:
+        device = _get_device()
+    
     # Use default mutation probability if not specified (1/n_var is default for PM)
     mutation_prob = config.mutation_prob if config.mutation_prob is not None else (1.0 / problem.n_var)
     
@@ -1154,11 +1220,23 @@ def run_nsga(
     feature_ranges = problem.xu - problem.xl
     feature_ranges[feature_ranges == 0] = 1.0  # Avoid division by zero
     
+    # Convert X_obs to numpy if needed for sklearn-based ConditionalMutator
+    X_obs_np = None
+    if X_obs is not None:
+        if isinstance(X_obs, torch.Tensor):
+            X_obs_np = X_obs.cpu().numpy() if X_obs.is_cuda else X_obs.numpy()
+        else:
+            X_obs_np = np.asarray(X_obs)
+        # Flatten if needed
+        if X_obs_np.ndim > 2:
+            X_obs_np = X_obs_np.reshape(X_obs_np.shape[0], -1)
+    
     # Setup base mutation operator
-    if config.use_conditional_mutator and X_obs is not None:
+    if config.use_conditional_mutator and X_obs_np is not None:
         # Use MOC-style Conditional Mutator (hybrid with PM)
+        # Note: ConditionalMutator uses sklearn which needs numpy for training
         base_mutation = HybridMutator(
-            X_obs=X_obs,
+            X_obs=X_obs_np,
             conditional_prob=config.conditional_mutator_prob,
             mutation_prob=mutation_prob,
             pm_eta=int(config.mutation_eta),
@@ -1171,15 +1249,20 @@ def run_nsga(
     
     # Optionally wrap with reset operator
     if config.use_reset_operator and x_factual is not None:
-        # Create reset operator
+        # Create reset operator with GPU support
         reset_op = ResetOperator(
             x_factual=x_factual,
-            p_reset=config.reset_prob
+            p_reset=config.reset_prob,
+            device=device
         )
         # Wrap mutation with reset
         mutation = MutationWithReset(mutation=base_mutation, reset=reset_op)
     else:
         mutation = base_mutation
+    
+    # Disable duplicate elimination for high-dimensional problems to avoid memory issues
+    # scipy.spatial.distance.cdist in pymoo's duplicate elimination can cause MemoryError
+    eliminate_duplicates = problem.n_var < 500  # Only use for low-dimensional problems
     
     if config.use_moc_crowding:
         # Use MOC-style NSGA-II with modified crowding distance
@@ -1191,7 +1274,7 @@ def run_nsga(
             sampling=sampling or FloatRandomSampling(),
             crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
             mutation=mutation,
-            eliminate_duplicates=True,
+            eliminate_duplicates=eliminate_duplicates,
         )
     else:
         # Use standard NSGA-II
@@ -1200,7 +1283,7 @@ def run_nsga(
             sampling=sampling or FloatRandomSampling(),
             crossover=SBX(prob=config.crossover_prob, eta=int(config.crossover_eta)),
             mutation=mutation,
-            eliminate_duplicates=True,
+            eliminate_duplicates=eliminate_duplicates,
         )
     
     # Setup termination criteria
@@ -1222,7 +1305,6 @@ def run_nsga(
     )
     
     # Run optimization
-    # Note: verbose=False to avoid duplicate output (callback handles printing)
     result = minimize(
         problem,
         algorithm,
@@ -1231,8 +1313,5 @@ def run_nsga(
         callback=callback,
         verbose=False,
     )
-    
-    # Store callback history in the algorithm's callback for later retrieval
-    # The callback is accessible via result.algorithm.callback
     
     return result
